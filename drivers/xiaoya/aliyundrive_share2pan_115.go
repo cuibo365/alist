@@ -20,10 +20,10 @@
 // The share list API does not return content_hash (SHA1), which 115 rapid
 // upload requires. So downloading a file goes through:
 //
-//	1. copy the share file into the configured aliyun folder (free)
-//	2. poll the own-drive listing until the copy reports content_hash
-//	3. 115 rapid upload with that SHA1 (uppercase) -> pickcode
-//	4. 115 downurl -> CDN link (bound to the 115Browser UA + cookie)
+//  1. copy the share file into the configured aliyun folder (free)
+//  2. poll the own-drive listing until the copy reports content_hash
+//  3. 115 rapid upload with that SHA1 (uppercase) -> pickcode
+//  4. 115 downurl -> CDN link (bound to the 115Browser UA + cookie)
 //
 // Shortcuts: if the 115 account already holds a file with the same name and
 // size in the landing directory, its pickcode is reused directly. If the 115
@@ -33,6 +33,7 @@ package xiaoya
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/hex"
@@ -47,12 +48,12 @@ import (
 	"sync"
 	"time"
 
+	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
+	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
-	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
-	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -77,6 +78,14 @@ const (
 	// Aliyun WAF with a 405 page (the SDK bundled 27.0.5.7 is blocked today).
 	// Keep this a version 115 still accepts; current live version: 36.0.1.
 	appVerFallback115 = "36.0.1"
+
+	// sdkAppVer115 must equal the 115driver package-level `appVer` constant
+	// (pkg/driver/upload.go), because GenerateToken() hashes that constant into
+	// the initupload `token` while we send `appversion` ourselves: any mismatch
+	// makes 115 answer statusmsg "token invalid". 27.0.5.7 is also rejected
+	// outright these days (statuscode 403 "请升级到最新版本"), so we compute
+	// the token ourselves with the UA version instead — see token115.
+	md5Salt115 = "Qclm8MGWUv59TnrR0XPg"
 
 	copyPollTimes = 30 // seconds to wait for the aliyun copy to appear
 	aliPageSize   = 200
@@ -234,12 +243,17 @@ type ali115FileEntry struct {
 	Name string `json:"n"`
 	Size int64  `json:"s"`
 	Pick string `json:"pc"`
-	Cid  int64  `json:"cid"`
+	// 115 returns cid as a *string* ("3009883674856110511", and "0" for files);
+	// declaring it as an int made the whole list unmarshal fail, which resty
+	// swallows, leaving State=false and looking like "115 file list rejected".
+	Cid string `json:"cid"`
 }
 
 type ali115FileListResp struct {
 	State bool              `json:"state"`
 	Data  []ali115FileEntry `json:"data"`
+	Error string            `json:"error"`
+	ErrNo int               `json:"errNo"`
 }
 
 // ---------- driver ----------
@@ -756,7 +770,6 @@ func findPickcodeByName(cookie, dirID, name string, size int64) (string, error) 
 		return "", errors.New("empty dir id")
 	}
 	for offset := 0; offset <= maxOffset115; offset += page115 {
-		var list ali115FileListResp
 		res, err := base.RestyClient.R().
 			SetHeader("Cookie", cookie).
 			SetHeader("User-Agent", ua115()).
@@ -765,14 +778,20 @@ func findPickcodeByName(cookie, dirID, name string, size int64) (string, error) 
 				"cid": dirID, "limit": strconv.Itoa(page115), "offset": strconv.Itoa(offset),
 				"o": "user_ptime", "asc": "0", "fc_mix": "0", "format": "json",
 			}).
-			SetResult(&list).
 			Get(webAPI115 + "/files")
 		logResp("115:dir-files", res, err)
 		if err != nil {
 			return "", err
 		}
-		if !list.State {
-			return "", errors.New("115 file list rejected")
+		// 115 answers this endpoint with "Content-Type: text/html" while the body
+		// is JSON, and resty's SetResult only deserialises known content types —
+		// the struct would stay empty and every lookup looked "rejected".
+		var list ali115FileListResp
+		if err := json.Unmarshal(res.Body(), &list); err != nil {
+			return "", fmt.Errorf("115 file list decode failed: %w", err)
+		}
+		if !list.State && len(list.Data) == 0 {
+			return "", fmt.Errorf("115 file list rejected: errno=%d error=%q", list.ErrNo, list.Error)
 		}
 		for _, f := range list.Data {
 			if f.Name == name && f.Size == size {
@@ -830,9 +849,10 @@ func (d *AliyundriveShare2Pan115) init115Upload(client *driver115.Pan115Client, 
 		return nil, err
 	}
 	sizeStr := strconv.FormatInt(size, 10)
+	appVer := latest115AppVer()
 	form := url.Values{}
 	form.Set("appid", "0")
-	form.Set("appversion", latest115AppVer())
+	form.Set("appversion", appVer)
 	form.Set("userid", strconv.FormatInt(client.UserID, 10))
 	form.Set("filename", name)
 	form.Set("filesize", sizeStr)
@@ -847,7 +867,7 @@ func (d *AliyundriveShare2Pan115) init115Upload(client *driver115.Pan115Client, 
 		return nil, err
 	}
 	form.Set("t", strconv.FormatInt(t, 10))
-	form.Set("token", client.GenerateToken(fileID, "0", strconv.FormatInt(t, 10), sizeStr, signKey, signVal))
+	form.Set("token", token115(client.UserID, fileID, sizeStr, signKey, signVal, strconv.FormatInt(t, 10), appVer))
 	if signKey != "" && signVal != "" {
 		form.Set("sign_key", signKey)
 		form.Set("sign_val", signVal)
@@ -887,10 +907,30 @@ func (d *AliyundriveShare2Pan115) init115Upload(client *driver115.Pan115Client, 
 	if err := json.Unmarshal(decrypted, &result); err != nil {
 		return nil, err
 	}
-	if err := result.Err(); err != nil {
-		return nil, err
+	// status 2 (hit) and 7 (sign_check round) are both normal: 7 still carries
+	// statusmsg "sig invalid" / statuscode 701, so UploadInitResp.Err() must not
+	// be treated as fatal here or the sign_check round never happens.
+	switch result.Status {
+	case 2, 7:
+	default:
+		if result.ErrorMsg != "" {
+			return nil, fmt.Errorf("115 initupload rejected: status=%d code=%d msg=%s",
+				result.Status, result.ErrorCode, result.ErrorMsg)
+		}
+		return nil, fmt.Errorf("115 initupload failed: status=%d code=%d", result.Status, result.ErrorCode)
 	}
 	return &result, nil
+}
+
+// token115 reimplements 115driver's GenerateToken, which hashes the SDK's
+// hardcoded appVer ("27.0.5.7") into the digest. 115 now rejects that version
+// (statuscode 403 "请升级到最新版本") and also expects the token to be signed
+// with the same appversion we submit, so the version has to be a parameter.
+func token115(userID int64, fileID, fileSize, signKey, signVal, timeStamp, appVer string) string {
+	uid := strconv.FormatInt(userID, 10)
+	uidMD5 := md5.Sum([]byte(uid))
+	sum := md5.Sum([]byte(md5Salt115 + fileID + fileSize + signKey + signVal + uid + timeStamp + hex.EncodeToString(uidMD5[:]) + appVer))
+	return hex.EncodeToString(sum[:])
 }
 
 // digestAliRange fetches "start-end" bytes of our aliyun copy and hashes them.
