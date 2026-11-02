@@ -3,6 +3,7 @@ package _115_share
 import (
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
@@ -11,6 +12,44 @@ import (
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/pkg/errors"
 )
+
+// 115's share-download API rejects requests without a current 115Browser UA
+// (errno 50029 "当前版本过低"). Fetch the latest version once per process
+// (same scheme as drivers/115 appver.go) and fall back to the SDK bundled
+// value when the version service is unreachable.
+const appVerFallback = "27.0.5.7"
+
+const appVerURL = "https://appversion.115.com/1/web/1.0/api/chrome"
+
+var (
+	appVerOnce   sync.Once
+	appVerCached string
+)
+
+func latestAppVer() string {
+	appVerOnce.Do(func() {
+		var resp struct {
+			Data struct {
+				Win struct {
+					VersionCode string `json:"version_code"`
+				} `json:"win"`
+			} `json:"data"`
+		}
+		r, err := base.RestyClient.R().SetResult(&resp).Get(appVerURL)
+		if err == nil && r != nil && resp.Data.Win.VersionCode != "" {
+			appVerCached = resp.Data.Win.VersionCode
+		} else {
+			appVerCached = appVerFallback
+		}
+	})
+	return appVerCached
+}
+
+// browserUA is the UA the share endpoints accept; the CDN link returned by
+// the share downurl API is bound to it, so it must also ride on the download.
+func browserUA() string {
+	return "Mozilla/5.0 115Browser/" + latestAppVer()
+}
 
 var _ model.Obj = (*FileObj)(nil)
 
@@ -175,10 +214,10 @@ func (d *Pan115Share) downloadByShareCodeWithUA(ua, fileID string) (*driver115.S
 func (d *Pan115Share) login() error {
 	var err error
 	opts := []driver115.Option{
-		driver115.UA(base.UserAgent),
+		driver115.UA(browserUA()),
 	}
 	d.client = driver115.New(opts...)
-	if _, err = d.getShareSnapWithUA(base.UserAgent, ""); err != nil {
+	if _, err = d.getShareSnapWithUA(browserUA(), ""); err != nil {
 		return errors.Wrap(err, "failed to get share snap")
 	}
 	cr := &driver115.Credential{}

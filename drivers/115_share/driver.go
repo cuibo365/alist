@@ -2,9 +2,9 @@ package _115_share
 
 import (
 	"context"
+	"net/http"
 
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
-	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -51,7 +51,7 @@ func (d *Pan115Share) List(ctx context.Context, dir model.Obj, args model.ListAr
 		return nil, err
 	}
 
-	ua := base.UserAgent
+	ua := browserUA()
 	files := make([]shareFile, 0)
 	fileResp, err := d.getShareSnapWithUA(ua, dir.GetID(), driver115.QueryLimit(int(d.PageSize)))
 	if err != nil {
@@ -76,19 +76,21 @@ func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
-	ua := ""
-	if args.Header != nil {
-		ua = args.Header.Get("User-Agent")
-	}
-	if ua == "" {
-		ua = base.UserAgent
-	}
+	// The share downurl API rejects generic UAs (errno 50029 "版本过低") and
+	// binds the returned CDN link to the UA used here — pass the 115Browser
+	// UA and send it back to the downloader as well.
+	ua := browserUA()
 	downloadInfo, err := d.downloadByShareCodeWithUA(ua, file.GetID())
 	if err != nil {
 		return nil, err
 	}
 
-	return &model.Link{URL: downloadInfo.URL.URL}, nil
+	return &model.Link{
+		URL: downloadInfo.URL.URL,
+		Header: http.Header{
+			"User-Agent": []string{ua},
+		},
+	}, nil
 }
 
 func (d *Pan115Share) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
