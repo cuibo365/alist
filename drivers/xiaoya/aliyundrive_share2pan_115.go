@@ -64,6 +64,7 @@ const (
 	aliShareListURL  = "https://api.alipan.com/adrive/v3/file/list"
 	aliCopyURL       = "https://api.alipan.com/v2/file/copy"
 	aliOwnListURL    = "https://api.aliyundrive.com/adrive/v3/file/list"
+	aliOwnFileURL    = "https://api.aliyundrive.com/v2/file/get"
 	aliUserGetURL    = "https://user.aliyundrive.com/v2/user/get"
 	aliDownURL       = "https://api.alipan.com/v2/file/get_download_url"
 
@@ -87,7 +88,8 @@ const (
 	// the token ourselves with the UA version instead — see token115.
 	md5Salt115 = "Qclm8MGWUv59TnrR0XPg"
 
-	copyPollTimes = 30 // seconds to wait for the aliyun copy to appear
+	copyPollTries = 20                     // attempts to read content_hash of the fresh copy
+	copyPollDelay = 300 * time.Millisecond // between those attempts
 	aliPageSize   = 200
 	page115       = 115
 	maxOffset115  = 5000
@@ -218,6 +220,17 @@ type aliListResp struct {
 	Message    string        `json:"message"`
 }
 
+// aliOwnFileResp is the /v2/file/get answer: the copy is a server-side op, so
+// asking for the copied file directly yields content_hash without paging the
+// whole destination folder.
+type aliOwnFileResp struct {
+	FileId      string `json:"file_id"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	ContentHash string `json:"content_hash"`
+	Message     string `json:"message"`
+}
+
 type aliUserResp struct {
 	ResourceDriveId string `json:"resource_drive_id"`
 	DefaultDriveId  string `json:"default_drive_id"`
@@ -264,6 +277,9 @@ type AliyundriveShare2Pan115 struct {
 	mu               sync.Mutex
 	client           *driver115.Pan115Client
 	lastCopiedFileId string
+	// pickCache memoises (name,size) -> 115 pickcode so replaying a file skips
+	// the 115 directory listing entirely.
+	pickCache map[string]string
 }
 
 func (d *AliyundriveShare2Pan115) Config() driver.Config {
@@ -355,6 +371,17 @@ func (d *AliyundriveShare2Pan115) List(ctx context.Context, dir model.Obj, args 
 }
 
 func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	t0, last := time.Now(), time.Now()
+	var marks []string
+	mark := func(name string) {
+		now := time.Now()
+		marks = append(marks, fmt.Sprintf("%s=%dms", name, now.Sub(last).Milliseconds()))
+		last = now
+	}
+	defer func() {
+		log.Infof("[xiaoya/115:timing] %s total=%dms", strings.Join(marks, " "), time.Since(t0).Milliseconds())
+	}()
+
 	// 1. context: tokens + drive ids + 115 client
 	if err := d.ensureWebToken(); err != nil {
 		return nil, err
@@ -366,6 +393,7 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 		return nil, err
 	}
 	client, err := d.ensure115Client()
+	mark("init")
 	if err != nil {
 		log.Warnf("share2pan115: 115 client failed: %v (fall back to aliyun link)", err)
 		return d.aliyunFallbackLink(ctx, file)
@@ -376,17 +404,36 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 		return d.aliyunFallbackLink(ctx, file)
 	}
 
-	// 2. shortcut: 115 already holds a file with the same name+size
-	pick, err := findPickcodeByName(d.AliyunShare115Addition.Cookie, recvCid, file.GetName(), file.GetSize())
-	if err != nil {
-		log.Warnf("share2pan115: 115 lookup failed: %v", err)
+	// 2. shortcut: 115 already holds a file with the same name+size. The result
+	// is memoised per (name,size) so replaying a file skips the 115 directory
+	// listing (which pages 115 entries at a time) entirely.
+	key := cacheKey115(file.GetName(), file.GetSize())
+	pick := d.cachedPickcode(key)
+	if pick != "" {
+		if l, err := d.downlink(client, pick); err == nil {
+			mark("cached-down")
+			return l, nil
+		}
+		d.dropPickcode(key) // stale entry: the file is gone from 115
+		pick = ""
+	}
+	if pick == "" {
+		pick, err = findPickcodeByName(d.AliyunShare115Addition.Cookie, recvCid, file.GetName(), file.GetSize())
+		mark("lookup")
+		if err != nil {
+			log.Warnf("share2pan115: 115 lookup failed: %v", err)
+		}
 	}
 	if pick != "" {
-		return d.downlink(client, pick)
+		d.storePickcode(key, pick)
+		l, err := d.downlink(client, pick)
+		mark("down")
+		return l, err
 	}
 
 	// 3. copy the share file into our own aliyun folder, get its SHA1
 	sha1Upper, err := d.obtainSha1(ctx, file)
+	mark("sha1")
 	if err != nil {
 		log.Warnf("share2pan115: obtain sha1 failed: %v (fall back to aliyun link)", err)
 		return d.aliyunFallbackLink(ctx, file)
@@ -394,11 +441,45 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 
 	// 4. 115 rapid upload with the SHA1
 	pick, err = d.rapidUpload(client, file.GetName(), file.GetSize(), recvCid, sha1Upper)
+	mark("rapid")
 	if err != nil {
 		log.Warnf("share2pan115: rapid upload failed: %v (fall back to aliyun link)", err)
 		return d.aliyunFallbackLink(ctx, file)
 	}
-	return d.downlink(client, pick)
+	d.storePickcode(key, pick)
+	l, err := d.downlink(client, pick)
+	mark("down")
+	return l, err
+}
+
+// ---------- pickcode memo ----------
+
+func cacheKey115(name string, size int64) string {
+	return name + "\x00" + strconv.FormatInt(size, 10)
+}
+
+func (d *AliyundriveShare2Pan115) cachedPickcode(key string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pickCache[key]
+}
+
+func (d *AliyundriveShare2Pan115) storePickcode(key, pick string) {
+	if pick == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pickCache == nil {
+		d.pickCache = make(map[string]string)
+	}
+	d.pickCache[key] = pick
+}
+
+func (d *AliyundriveShare2Pan115) dropPickcode(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.pickCache, key)
 }
 
 var _ driver.Driver = (*AliyundriveShare2Pan115)(nil)
@@ -625,19 +706,53 @@ func (d *AliyundriveShare2Pan115) obtainSha1(ctx context.Context, file model.Obj
 	}
 	d.lastCopiedFileId = copied
 
-	// poll our folder until the copy appears with content_hash
-	for i := 0; i < copyPollTimes; i++ {
-		time.Sleep(time.Second)
+	// Ask for the copied file itself: /v2/file/get is O(1) and returns
+	// content_hash as soon as the server-side copy lands, whereas the old poll
+	// paged the whole destination folder (and slept a full second first).
+	for i := 0; i < copyPollTries; i++ {
+		if i > 0 {
+			time.Sleep(copyPollDelay)
+		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		sha1v, fid, ok, lerr := d.findOwnFile(ctx, file.GetName(), file.GetSize())
-		if lerr == nil && ok && sha1v != "" {
-			d.lastCopiedFileId = fid
+		sha1v, ok, lerr := d.ownFileHash(copied)
+		if lerr != nil {
+			log.Warnf("share2pan115: file/get failed: %v", lerr)
+		} else if ok {
 			return strings.ToUpper(sha1v), nil
 		}
 	}
-	return "", fmt.Errorf("copy of %s did not appear within %ds", file.GetName(), copyPollTimes)
+
+	// Fallback: the copy id is unusable for this account (or hash still empty),
+	// so scan the folder by name+size as before.
+	if sha1v, fid, ok, lerr := d.findOwnFile(ctx, file.GetName(), file.GetSize()); lerr == nil && ok && sha1v != "" {
+		d.lastCopiedFileId = fid
+		return strings.ToUpper(sha1v), nil
+	}
+	return "", fmt.Errorf("copy of %s did not expose content_hash in time", file.GetName())
+}
+
+// ownFileHash returns content_hash of one of our own files (empty when the
+// copy has not been indexed yet).
+func (d *AliyundriveShare2Pan115) ownFileHash(fileId string) (string, bool, error) {
+	var resp aliOwnFileResp
+	res, err := base.RestyClient.R().
+		SetHeaders(map[string]string{
+			"Authorization": "Bearer " + d.AliyunShare115Addition.AccessToken,
+			"X-Canary":      canaryOwn,
+		}).
+		SetBody(base.Json{"drive_id": d.AliyunShare115Addition.OwnDriveId, "file_id": fileId}).
+		SetResult(&resp).
+		Post(aliOwnFileURL)
+	logResp("ali:file-get", res, err)
+	if err != nil {
+		return "", false, err
+	}
+	if resp.ContentHash == "" {
+		return "", false, nil
+	}
+	return resp.ContentHash, true, nil
 }
 
 // findOwnFile scans TempTransferFolderID for a name+size match.
@@ -946,26 +1061,47 @@ func (d *AliyundriveShare2Pan115) digestAliRange(rangeSpec string) (string, erro
 	if err != nil {
 		return "", err
 	}
+	tURL := time.Now()
 	req, _ := http.NewRequest(http.MethodGet, dl.URL, nil)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	// ask for the exact bytes: a gzip/br attempt on a range request only adds a
+	// round trip and breaks the byte mapping
+	req.Header.Set("Accept-Encoding", "identity")
 	if dl.Header.Get("Referer") != "" {
 		req.Header.Set("Referer", dl.Header.Get("Referer"))
 	}
 	res, err := base.HttpClient.Do(req)
 	if err != nil {
-		log.Infof("[xiaoya/ali:range-proof] GET %s error: %v", dl.URL, err)
+		log.Infof("[xiaoya/ali:range-proof] GET %s error: %v", shortURL(dl.URL), err)
 		return "", err
 	}
 	defer res.Body.Close()
-	log.Infof("[xiaoya/ali:range-proof] GET %s -> %d (bytes %d-%d)", dl.URL, res.StatusCode, start, end)
+	tBody := time.Now()
 	if res.StatusCode != 206 && res.StatusCode != 200 {
+		log.Infof("[xiaoya/ali:range-proof] GET %s -> %d", shortURL(dl.URL), res.StatusCode)
 		return "", fmt.Errorf("range read status %d", res.StatusCode)
 	}
 	h := sha1.New()
-	if _, err := io.Copy(h, res.Body); err != nil {
+	n, err := io.Copy(h, res.Body)
+	if err != nil {
 		return "", err
 	}
+	log.Infof("[xiaoya/ali:range-proof] GET %s -> %d bytes=%d ttfb=%dms read=%dms (range %d-%d)",
+		shortURL(dl.URL), res.StatusCode, n, tBody.Sub(tURL).Milliseconds(), time.Since(tBody).Milliseconds(), start, end)
 	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
+}
+
+// shortURL keeps logs readable: the pre-signed aliyun URL is ~1.5 KB.
+func shortURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	p := u.Path
+	if len(p) > 24 {
+		p = p[:24] + "…"
+	}
+	return u.Host + p
 }
 
 func (d *AliyundriveShare2Pan115) downlink(client *driver115.Pan115Client, pick string) (*model.Link, error) {
