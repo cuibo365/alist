@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	m115 "github.com/SheltonZhu/115driver/pkg/crypto/m115"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -141,11 +143,6 @@ type shareSnapResp struct {
 	} `json:"data"`
 }
 
-type downloadShareResp struct {
-	driver115.BasicResp
-	Data driver115.SharedDownloadInfo `json:"data"`
-}
-
 func transFunc(sf shareFile) (model.Obj, error) {
 	timeInt, err := strconv.ParseInt(sf.UpdateTime, 10, 64)
 	if err != nil {
@@ -205,29 +202,90 @@ func (d *Pan115Share) getShareSnapWithUA(ua, dirID string, queries ...driver115.
 	return &result, nil
 }
 
-func (d *Pan115Share) downloadByShareCodeWithUA(ua, fileID string) (*driver115.SharedDownloadInfo, error) {
-	result := downloadShareResp{}
-	params := map[string]string{
+// appShareDownURL is the *app* share-downurl endpoint (what 115's own browser
+// and apps call). The web endpoint the SDK ships
+// (driver115.ApiDownloadGetShareUrl = 115cdn.com/webapi/share/downurl) now
+// answers every web client with errno 50029 "当前版本过低" regardless of the UA,
+// so the app endpoint is the only one that still resolves share files.
+const appShareDownURL = "https://proapi.115.com/app/share/downurl"
+
+// downloadByShareCodeWithUA resolves a share file's CDN URL through the app
+// endpoint: the request body is an m115-encrypted JSON payload and the account
+// cookie must ride along, and the response carries the download info encrypted
+// the same way. It also returns the Set-Cookie values issued by the response,
+// which the CDN expects in addition to the account cookie.
+func (d *Pan115Share) downloadByShareCodeWithUA(ua, fileID string) (*driver115.SharedDownloadInfo, []string, error) {
+	key := m115.GenerateKey()
+	payload, err := json.Marshal(map[string]string{
 		"share_code":   d.ShareCode,
 		"receive_code": d.ReceiveCode,
 		"file_id":      fileID,
-		"dl":           "1",
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 
+	result := struct {
+		driver115.BasicResp
+		Data string `json:"data"`
+	}{}
 	req := d.client.NewRequest().
-		SetQueryParams(params).
+		SetQueryParam("t", driver115.Now().String()).
+		SetFormData(map[string]string{"data": m115.Encode(payload, key)}).
+		// 115's app endpoints are called with a JSON content type even though the
+		// body is form encoded (this is what 115's own clients do).
+		SetHeader("Content-Type", "application/json;charset=UTF-8").
+		SetHeader("Cookie", d.Cookie).
+		SetHeader("Accept", "application/json;charset=UTF-8").
 		ForceContentType("application/json").
-		SetHeader("referer", buildShareReferer(d.ShareCode, d.ReceiveCode)).
 		SetResult(&result)
 	if ua != "" {
 		req = req.SetHeader("User-Agent", ua)
 	}
 
-	resp, err := req.Get(driver115.ApiDownloadGetShareUrl)
-	if err := driver115.CheckErr(err, &result, resp); err != nil {
-		return nil, err
+	resp, err := req.Post(appShareDownURL)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to call 115 share downurl")
 	}
-	return &result.Data, nil
+	if resp == nil {
+		return nil, nil, errors.New("empty response from 115 share downurl")
+	}
+	if err := driver115.CheckErr(nil, &result, resp); err != nil {
+		body := strings.ReplaceAll(resp.String(), "\n", " ")
+		if len(body) > 200 {
+			body = body[:200] + "..."
+		}
+		log.Infof("[115share/downurl] share=%s file=%s -> %d %s", d.ShareCode, fileID, resp.StatusCode(), body)
+		return nil, nil, err
+	}
+
+	plain, err := m115.Decode(result.Data, key)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to decrypt 115 share download info")
+	}
+	info := &driver115.SharedDownloadInfo{}
+	if err := json.Unmarshal(plain, info); err != nil {
+		return nil, nil, errors.Wrap(err, "failed to parse 115 share download info")
+	}
+	if info.URL.URL == "" {
+		return nil, nil, fmt.Errorf("115 returned no download url for file %s", fileID)
+	}
+	return info, resp.Header().Values("Set-Cookie"), nil
+}
+
+// mergeCookie joins the account cookie with the Set-Cookie values issued by
+// the share-downurl response; the CDN accepts only requests carrying both.
+func mergeCookie(account string, setCookies []string) string {
+	parts := make([]string, 0, len(setCookies)+1)
+	if c := strings.TrimSpace(account); c != "" {
+		parts = append(parts, c)
+	}
+	for _, sc := range setCookies {
+		if kv := strings.TrimSpace(strings.SplitN(sc, ";", 2)[0]); kv != "" {
+			parts = append(parts, kv)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (d *Pan115Share) login() error {
