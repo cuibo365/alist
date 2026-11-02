@@ -43,6 +43,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,10 @@ const (
 	aliOwnFileURL    = "https://api.aliyundrive.com/v2/file/get"
 	aliUserGetURL    = "https://user.aliyundrive.com/v2/user/get"
 	aliDownURL       = "https://api.alipan.com/v2/file/get_download_url"
+	// aliShareDownURL resolves a direct link to a file *inside the share* (no
+	// copy needed); used as the second, usually already-warm channel for the
+	// 115 sign-proof range read.
+	aliShareDownURL = "https://api.alipan.com/v2/file/get_share_link_download_url"
 
 	canaryShare = "client=web,app=share,version=v2.3.1"
 	canaryOwn   = "client=windows,app=adrive,version=v6.0.0"
@@ -280,12 +285,23 @@ type AliyundriveShare2Pan115 struct {
 	// pickCache memoises (name,size) -> 115 pickcode so replaying a file skips
 	// the 115 directory listing entirely.
 	pickCache map[string]string
-	// warmLink / warmFor hold the pre-fetched download link of the file we just
-	// copied, so the sign-proof step does not have to pay for it again.
-	warmMu   sync.Mutex
-	warmLink *model.Link
-	warmFor  string
-	warmCh   chan struct{}
+	// warmCands holds the pre-probed ways of reading the bytes we just copied
+	// (our own copy and the original share file), sorted fastest-first, so the
+	// sign-proof step can pick a channel that is actually warm.
+	warmMu    sync.Mutex
+	warmCands []aliRangeCandidate
+	warmFor   string
+	warmCh    chan struct{}
+}
+
+// aliRangeCandidate is one channel that can serve bytes of the file being
+// sign-proved: the object we just copied into our own drive, or the original
+// share file. ttfb is measured with a 1-byte range read during warmup.
+type aliRangeCandidate struct {
+	tag  string
+	link *model.Link
+	ttfb time.Duration
+	err  error
 }
 
 func (d *AliyundriveShare2Pan115) Config() driver.Config {
@@ -445,9 +461,10 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 		return d.aliyunFallbackLink(ctx, file)
 	}
 	// The copy is brand new, so its object is cold on the PDS side and the
-	// first read off the CDN is what dominates the latency. Resolve the link
-	// and touch the first byte now, in parallel with the 115 initupload below.
-	d.startAliWarmup(d.lastCopiedFileId)
+	// first read off the CDN is what dominates the latency. Resolve the links
+	// and touch the first byte now, in parallel with the 115 initupload below,
+	// probing both our copy and the original share file.
+	d.startAliWarmup(d.lastCopiedFileId, file.GetID())
 
 	// 4. 115 rapid upload with the SHA1
 	pick, err = d.rapidUpload(client, file.GetName(), file.GetSize(), recvCid, sha1Upper)
@@ -1070,54 +1087,128 @@ func token115(userID int64, fileID, fileSize, signKey, signVal, timeStamp, appVe
 	return hex.EncodeToString(sum[:])
 }
 
-// startAliWarmup resolves the download link of the freshly copied file and
-// touches its first byte in the background. Getting that link and especially
-// pulling the first byte off the CDN is the slowest step of the whole chain
-// (the copy was just created, so its object is still cold on the PDS side), and
-// it does not depend on anything the 115 side needs — running it while
-// initupload runs hides most of the latency.
-func (d *AliyundriveShare2Pan115) startAliWarmup(fileID string) {
-	if fileID == "" {
+// startAliWarmup resolves the ways we can read the file we just copied and
+// touches their first byte in the background. That first byte is the slowest
+// step of the whole chain — a 140 KB sign-proof read spends ~7.5s in TTFB and
+// ~40ms actually reading — and it does not depend on anything the 115 side
+// needs, so it runs in parallel with initupload.
+//
+// Two channels are probed because they are backed by different objects: the
+// copy we just created (cold on the PDS side, link carries a download-audit
+// callback) and the original share file (already materialised, usually warm).
+// Whichever answers its 1-byte range read first wins.
+func (d *AliyundriveShare2Pan115) startAliWarmup(ownFileID, shareFileID string) {
+	if ownFileID == "" && shareFileID == "" {
 		return
 	}
 	ch := make(chan struct{})
 	d.warmMu.Lock()
-	d.warmLink, d.warmFor, d.warmCh = nil, fileID, ch
+	d.warmCands, d.warmFor, d.warmCh = nil, ownFileID, ch
 	d.warmMu.Unlock()
+
+	type probe struct {
+		tag string
+		get func() (*model.Link, error)
+	}
+	probes := make([]probe, 0, 2)
+	if ownFileID != "" {
+		probes = append(probes, probe{"own", func() (*model.Link, error) { return d.aliyunDownloadLink(ownFileID) }})
+	}
+	if shareFileID != "" {
+		probes = append(probes, probe{"share", func() (*model.Link, error) { return d.shareDownloadLink(shareFileID) }})
+	}
 
 	go func() {
 		defer close(ch)
-		link, err := d.aliyunDownloadLink(fileID)
-		if err != nil || link == nil || link.URL == "" {
-			return
-		}
-		// 1-byte range read: makes the CDN fill its cache for this object
-		// without spending bandwidth. Failures are irrelevant — the real read
-		// below just gets a cold object again.
-		if req, e := http.NewRequest(http.MethodGet, link.URL, nil); e == nil {
-			req.Header.Set("Range", "bytes=0-0")
-			req.Header.Set("Accept-Encoding", "identity")
-			req.Header.Set("Referer", "https://www.alipan.com/")
-			if res, e2 := base.HttpClient.Do(req); e2 == nil {
-				io.Copy(io.Discard, res.Body)
+		out := make(chan aliRangeCandidate, len(probes))
+		var wg sync.WaitGroup
+		for _, p := range probes {
+			wg.Add(1)
+			go func(p probe) {
+				defer wg.Done()
+				link, err := p.get()
+				if err != nil {
+					out <- aliRangeCandidate{tag: p.tag, err: err}
+					return
+				}
+				if link == nil || link.URL == "" {
+					out <- aliRangeCandidate{tag: p.tag, err: errors.New("empty link")}
+					return
+				}
+				// 1-byte range read: warms the edge without spending bandwidth
+				// and measures the TTFB this channel really has.
+				st := time.Now()
+				req, e := http.NewRequest(http.MethodGet, link.URL, nil)
+				if e != nil {
+					out <- aliRangeCandidate{tag: p.tag, err: e}
+					return
+				}
+				req.Header.Set("Range", "bytes=0-0")
+				req.Header.Set("Accept-Encoding", "identity")
+				req.Header.Set("Referer", "https://www.alipan.com/")
+				res, e := base.HttpClient.Do(req)
+				if e != nil {
+					out <- aliRangeCandidate{tag: p.tag, err: e}
+					return
+				}
+				// hard cap: a server that ignores Range would otherwise stream
+				// the whole file just for a probe
+				io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
 				res.Body.Close()
+				if res.StatusCode != 206 {
+					out <- aliRangeCandidate{tag: p.tag, err: fmt.Errorf("ignores Range (HTTP %d)", res.StatusCode)}
+					return
+				}
+				out <- aliRangeCandidate{tag: p.tag, link: link, ttfb: time.Since(st)}
+			}(p)
+		}
+		go func() { wg.Wait(); close(out) }()
+
+		var cands []aliRangeCandidate
+		var parts []string
+		for c := range out {
+			cands = append(cands, c)
+			if c.err != nil {
+				parts = append(parts, fmt.Sprintf("%s=err(%v)", c.tag, c.err))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s=%dms", c.tag, c.ttfb.Milliseconds()))
 			}
 		}
+		// usable channels first, then by measured TTFB
+		sort.SliceStable(cands, func(i, j int) bool {
+			if (cands[i].link != nil) != (cands[j].link != nil) {
+				return cands[i].link != nil
+			}
+			return cands[i].ttfb < cands[j].ttfb
+		})
+		if len(cands) > 0 && cands[0].link != nil {
+			parts = append(parts, "use="+cands[0].tag)
+		}
+		log.Infof("[xiaoya/ali:warmup] %s %s", strings.Join(parts, " "), shortURL(firstURL(cands)))
 		d.warmMu.Lock()
-		if d.warmFor == fileID {
-			d.warmLink = link
+		if d.warmFor == ownFileID && ownFileID != "" {
+			d.warmCands = cands
 		}
 		d.warmMu.Unlock()
 	}()
 }
 
-// takeWarmLink returns the pre-fetched link for fileID, waiting for the warmup
-// that is already in flight. Returns nil when there is nothing to reuse.
-func (d *AliyundriveShare2Pan115) takeWarmLink(fileID string) *model.Link {
+func firstURL(cands []aliRangeCandidate) string {
+	for _, c := range cands {
+		if c.link != nil {
+			return c.link.URL
+		}
+	}
+	return ""
+}
+
+// takeWarmCands returns the probed channels for ownFileID, waiting for the
+// warmup that is already in flight. Nil when there is nothing to reuse.
+func (d *AliyundriveShare2Pan115) takeWarmCands(ownFileID string) []aliRangeCandidate {
 	d.warmMu.Lock()
-	ch, match := d.warmCh, d.warmFor == fileID
+	ch, match := d.warmCh, d.warmFor == ownFileID
 	d.warmMu.Unlock()
-	if !match {
+	if !match || ownFileID == "" {
 		return nil
 	}
 	if ch != nil {
@@ -1128,13 +1219,55 @@ func (d *AliyundriveShare2Pan115) takeWarmLink(fileID string) *model.Link {
 	}
 	d.warmMu.Lock()
 	defer d.warmMu.Unlock()
-	if d.warmFor != fileID {
+	if d.warmFor != ownFileID {
 		return nil
 	}
-	return d.warmLink
+	return d.warmCands
 }
 
-// digestAliRange fetches "start-end" bytes of our aliyun copy and hashes them.
+// shareDownloadLink resolves a direct download URL for a file inside the share,
+// using the share token — no copy involved.
+func (d *AliyundriveShare2Pan115) shareDownloadLink(fileID string) (*model.Link, error) {
+	if err := d.ensureShareToken(); err != nil {
+		return nil, err
+	}
+	if err := d.ensureWebToken(); err != nil {
+		return nil, err
+	}
+	if d.AliyunShare115Addition.ShareDriveId == "" {
+		return nil, errors.New("share drive_id unknown")
+	}
+	var resp aliDownUrlResp
+	res, err := base.RestyClient.R().
+		SetHeaders(shareHeaders(d.AliyunShare115Addition.AccessToken, d.AliyunShare115Addition.ShareToken)).
+		SetBody(base.Json{
+			"drive_id":   d.AliyunShare115Addition.ShareDriveId,
+			"file_id":    fileID,
+			"share_id":   d.AliyunShare115Addition.ShareId,
+			"expire_sec": 600,
+		}).
+		SetResult(&resp).
+		Post(aliShareDownURL)
+	logResp("ali:share-download-url", res, err)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Url == "" {
+		return nil, fmt.Errorf("share download url failed: %s", resp.Message)
+	}
+	if strings.Contains(resp.Url, "callback=") {
+		log.Infof("[xiaoya/ali:share-download-url] link uses the callback channel")
+	}
+	return &model.Link{
+		URL:    resp.Url,
+		Header: http.Header{"Referer": []string{"https://www.alipan.com/"}},
+	}, nil
+}
+
+// digestAliRange fetches "start-end" bytes of the file being sign-proved and
+// hashes them. Candidates are tried in the order the warmup measured them
+// (share file vs. our own copy), so a channel with a bad TTFB does not stall
+// the proof.
 func (d *AliyundriveShare2Pan115) digestAliRange(rangeSpec string) (string, error) {
 	var start, end int64
 	if _, err := fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err != nil {
@@ -1143,15 +1276,36 @@ func (d *AliyundriveShare2Pan115) digestAliRange(rangeSpec string) (string, erro
 	if d.lastCopiedFileId == "" {
 		return "", errors.New("no copied file for range proof")
 	}
-	dl := d.takeWarmLink(d.lastCopiedFileId)
-	reused := dl != nil
-	if !reused {
-		var err error
-		dl, err = d.aliyunDownloadLink(d.lastCopiedFileId)
-		if err != nil {
-			return "", err
+	cands := d.takeWarmCands(d.lastCopiedFileId)
+	if len(cands) == 0 {
+		// warmup never ran (or was overwritten by a concurrent Link)
+		if link, err := d.aliyunDownloadLink(d.lastCopiedFileId); err == nil {
+			cands = []aliRangeCandidate{{tag: "own-fresh", link: link}}
 		}
 	}
+
+	var lastErr error
+	for _, c := range cands {
+		if c.link == nil {
+			if c.err != nil {
+				lastErr = c.err
+			}
+			continue
+		}
+		sum, err := d.readAliRange(c.link, start, end, c.tag)
+		if err == nil {
+			return sum, nil
+		}
+		log.Infof("[xiaoya/ali:range-proof] channel %s failed: %v (next)", c.tag, err)
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no usable aliyun download channel")
+	}
+	return "", lastErr
+}
+
+func (d *AliyundriveShare2Pan115) readAliRange(dl *model.Link, start, end int64, tag string) (string, error) {
 	tURL := time.Now()
 	req, _ := http.NewRequest(http.MethodGet, dl.URL, nil)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
@@ -1163,22 +1317,27 @@ func (d *AliyundriveShare2Pan115) digestAliRange(rangeSpec string) (string, erro
 	}
 	res, err := base.HttpClient.Do(req)
 	if err != nil {
-		log.Infof("[xiaoya/ali:range-proof] GET %s error: %v", shortURL(dl.URL), err)
 		return "", err
 	}
 	defer res.Body.Close()
 	tBody := time.Now()
-	if res.StatusCode != 206 && res.StatusCode != 200 {
-		log.Infof("[xiaoya/ali:range-proof] GET %s -> %d", shortURL(dl.URL), res.StatusCode)
+	// 206 only: a 200 means the server ignored Range and started streaming the
+	// whole file, which would both blow up the transfer and hash the wrong
+	// bytes. Let the caller fall through to the other channel instead.
+	if res.StatusCode != 206 {
 		return "", fmt.Errorf("range read status %d", res.StatusCode)
 	}
+	want := end - start + 1
 	h := sha1.New()
-	n, err := io.Copy(h, res.Body)
+	n, err := io.Copy(h, io.LimitReader(res.Body, want))
 	if err != nil {
 		return "", err
 	}
-	log.Infof("[xiaoya/ali:range-proof] GET %s -> %d bytes=%d ttfb=%dms read=%dms (range %d-%d, warm=%v)",
-		shortURL(dl.URL), res.StatusCode, n, tBody.Sub(tURL).Milliseconds(), time.Since(tBody).Milliseconds(), start, end, reused)
+	if n != want {
+		return "", fmt.Errorf("short range read: got %d of %d bytes", n, want)
+	}
+	log.Infof("[xiaoya/ali:range-proof] %s GET %s -> %d bytes=%d ttfb=%dms read=%dms (range %d-%d)",
+		tag, shortURL(dl.URL), res.StatusCode, n, tBody.Sub(tURL).Milliseconds(), time.Since(tBody).Milliseconds(), start, end)
 	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
 }
 
