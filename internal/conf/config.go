@@ -134,7 +134,7 @@ func DefaultConfig() *Config {
 		Scheme: Scheme{
 			Address:    "0.0.0.0",
 			UnixFile:   "",
-			HttpPort:   5244,
+			HttpPort:   5678, // custom build default (upstream: 5244)
 			HttpsPort:  -1,
 			ForceHttps: false,
 			CertFile:   "",
