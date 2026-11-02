@@ -76,13 +76,10 @@ func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
-	ua := ""
-	if args.Header != nil {
-		ua = args.Header.Get("User-Agent")
-	}
-	if ua == "" {
-		ua = ua115()
-	}
+	// The share downurl API rejects any UA that is not 115Browser's (errno
+	// 50029 "当前版本过低"), so the caller's UA — args.Header carries the
+	// browser's, i.e. Chrome — must NOT be forwarded. Always resolve our own.
+	ua := ua115()
 	downloadInfo, err := d.downloadByShareCodeWithUA(ua, file.GetID())
 	if err != nil {
 		return nil, err
