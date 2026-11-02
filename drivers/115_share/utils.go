@@ -1,6 +1,8 @@
 package _115_share
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync"
@@ -11,43 +13,60 @@ import (
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
-// 115's share-download API rejects requests without a current 115Browser UA
-// (errno 50029 "当前版本过低"). Fetch the latest version once per process
-// (same scheme as drivers/115 appver.go) and fall back to the SDK bundled
-// value when the version service is unreachable.
-const appVerFallback = "27.0.5.7"
+const (
+	appVerURL115 = "https://appversion.115.com/1/web/1.0/api/chrome"
+	// appVerFallback115 is used when the live appversion.115.com query fails.
+	// 115 only accepts its own browser UA — the share downurl API answers a
+	// generic UA with errno 50029 — and a *stale* version is blocked by the
+	// Aliyun WAF with a 405 page (the SDK bundled 27.0.5.7 is blocked today).
+	// Keep this a version 115 still accepts; current live version: 36.0.1.
+	appVerFallback115 = "36.0.1"
+)
 
-const appVerURL = "https://appversion.115.com/1/web/1.0/api/chrome"
+// appVerResp mirrors appversion.115.com/1/web/1.0/api/chrome.
+type appVerResp struct {
+	Data struct {
+		Win struct {
+			VersionCode string `json:"version_code"`
+		} `json:"win"`
+	} `json:"data"`
+}
 
 var (
 	appVerOnce   sync.Once
 	appVerCached string
 )
 
+// latestAppVer resolves the current 115Browser version once per process. The
+// CDN link is bound to the UA, so every request path must use the same value.
+// On any failure it falls back to appVerFallback115, a version 115 accepts.
 func latestAppVer() string {
 	appVerOnce.Do(func() {
-		var resp struct {
-			Data struct {
-				Win struct {
-					VersionCode string `json:"version_code"`
-				} `json:"win"`
-			} `json:"data"`
+		appVerCached = appVerFallback115
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		res, err := base.RestyClient.R().SetContext(ctx).Get(appVerURL115)
+		// The endpoint declares "Content-Type: text/html" while returning JSON,
+		// so resty's SetResult would silently leave the struct empty: parse the
+		// raw body instead.
+		var resp appVerResp
+		if err != nil || res == nil || res.StatusCode() != 200 ||
+			json.Unmarshal(res.Body(), &resp) != nil || resp.Data.Win.VersionCode == "" {
+			log.Infof("[115share/appver] live query failed, using fallback %s", appVerFallback115)
+			return
 		}
-		r, err := base.RestyClient.R().SetResult(&resp).Get(appVerURL)
-		if err == nil && r != nil && resp.Data.Win.VersionCode != "" {
-			appVerCached = resp.Data.Win.VersionCode
-		} else {
-			appVerCached = appVerFallback
-		}
+		appVerCached = resp.Data.Win.VersionCode
+		log.Infof("[115share/appver] latest 115Browser version: %s", appVerCached)
 	})
 	return appVerCached
 }
 
-// browserUA is the UA the share endpoints accept; the CDN link returned by
-// the share downurl API is bound to it, so it must also ride on the download.
-func browserUA() string {
+// ua115 is the UA the share endpoints expect; the CDN link returned by the
+// share downurl API is bound to it, so it must also ride on the download.
+func ua115() string {
 	return "Mozilla/5.0 115Browser/" + latestAppVer()
 }
 
@@ -214,10 +233,10 @@ func (d *Pan115Share) downloadByShareCodeWithUA(ua, fileID string) (*driver115.S
 func (d *Pan115Share) login() error {
 	var err error
 	opts := []driver115.Option{
-		driver115.UA(browserUA()),
+		driver115.UA(ua115()),
 	}
 	d.client = driver115.New(opts...)
-	if _, err = d.getShareSnapWithUA(browserUA(), ""); err != nil {
+	if _, err = d.getShareSnapWithUA(ua115(), ""); err != nil {
 		return errors.Wrap(err, "failed to get share snap")
 	}
 	cr := &driver115.Credential{}

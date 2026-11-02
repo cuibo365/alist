@@ -71,9 +71,12 @@ const (
 
 	webAPI115    = "https://webapi.115.com"
 	appVerURL115 = "https://appversion.115.com/1/web/1.0/api/chrome"
-	// Fallback 115Browser version (SDK bundled value), used when the live
-	// appversion.115.com query fails; the CDN rejects stale versions with 403.
-	appVer115 = "27.0.5.7"
+	// appVerFallback115 is used when the live appversion.115.com query fails.
+	// 115 only accepts its own browser UA — the share downurl API answers a
+	// generic UA with errno 50029 — and a *stale* version is blocked by the
+	// Aliyun WAF with a 405 page (the SDK bundled 27.0.5.7 is blocked today).
+	// Keep this a version 115 still accepts; current live version: 36.0.1.
+	appVerFallback115 = "36.0.1"
 
 	copyPollTimes = 30 // seconds to wait for the aliyun copy to appear
 	aliPageSize   = 200
@@ -81,49 +84,48 @@ const (
 	maxOffset115  = 5000
 )
 
-// Latest 115Browser version, fetched once per process (rayburst m115_ua()
-// style): the downurl CDN link is bound to the UA, so list / flash-upload /
-// download must all use the same value returned by ua115().
+// appVerResp mirrors appversion.115.com/1/web/1.0/api/chrome.
+type appVerResp struct {
+	Data struct {
+		Win struct {
+			VersionCode string `json:"version_code"`
+		} `json:"win"`
+	} `json:"data"`
+}
+
 var (
 	appVerOnce   sync.Once
 	appVerCached string
 )
 
-// latest115AppVer queries appversion.115.com for the current 115Browser
-// version_code (data.win.version_code); on any error it falls back to the
-// bundled appVer115 so the driver keeps working offline.
+// latest115AppVer returns the current 115Browser version (rayburst m115_ua()
+// style): the CDN link is bound to the UA, so list / flash-upload / download
+// must all use the same value. On any failure it falls back to
+// appVerFallback115, which is a version 115 still accepts.
 func latest115AppVer() string {
 	appVerOnce.Do(func() {
-		var resp struct {
-			Data struct {
-				Win struct {
-					VersionCode string `json:"version_code"`
-				} `json:"win"`
-			} `json:"data"`
-		}
+		appVerCached = appVerFallback115
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		res, err := base.RestyClient.R().
-			SetContext(ctx).
-			SetResult(&resp).
-			Get(appVerURL115)
-		if err == nil && resp.Data.Win.VersionCode != "" {
-			appVerCached = resp.Data.Win.VersionCode
-		} else {
-			logResp("115:appver", res, err)
+		res, err := base.RestyClient.R().SetContext(ctx).Get(appVerURL115)
+		// The endpoint declares "Content-Type: text/html" while returning JSON,
+		// so resty's SetResult would silently leave the struct empty: parse the
+		// raw body instead.
+		var resp appVerResp
+		if err != nil || res == nil || res.StatusCode() != 200 ||
+			json.Unmarshal(res.Body(), &resp) != nil || resp.Data.Win.VersionCode == "" {
+			log.Infof("[xiaoya/115:appver] live query failed, using fallback %s", appVerFallback115)
+			return
 		}
-		if appVerCached == "" {
-			appVerCached = appVer115
-			log.Infof("[xiaoya/115:appver] live query failed, falling back to %s", appVer115)
-		} else {
-			log.Infof("[xiaoya/115:appver] latest 115Browser version: %s", appVerCached)
-		}
+		appVerCached = resp.Data.Win.VersionCode
+		log.Infof("[xiaoya/115:appver] latest 115Browser version: %s", appVerCached)
 	})
 	return appVerCached
 }
 
-// ua115 is the UA bound to 115 CDN links — same string must ride on the
-// flash-upload client, the directory listing and the download header.
+// ua115 is the UA bound to 115 CDN links — the same string must ride on the
+// flash-upload client, the directory listing, the appversion form field and
+// the download header.
 func ua115() string {
 	return "Mozilla/5.0 115Browser/" + latest115AppVer()
 }

@@ -51,7 +51,7 @@ func (d *Pan115Share) List(ctx context.Context, dir model.Obj, args model.ListAr
 		return nil, err
 	}
 
-	ua := browserUA()
+	ua := ua115()
 	files := make([]shareFile, 0)
 	fileResp, err := d.getShareSnapWithUA(ua, dir.GetID(), driver115.QueryLimit(int(d.PageSize)))
 	if err != nil {
@@ -76,19 +76,25 @@ func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
-	// The share downurl API rejects generic UAs (errno 50029 "版本过低") and
-	// binds the returned CDN link to the UA used here — pass the 115Browser
-	// UA and send it back to the downloader as well.
-	ua := browserUA()
+	ua := ""
+	if args.Header != nil {
+		ua = args.Header.Get("User-Agent")
+	}
+	if ua == "" {
+		ua = ua115()
+	}
 	downloadInfo, err := d.downloadByShareCodeWithUA(ua, file.GetID())
 	if err != nil {
 		return nil, err
 	}
 
+	// The CDN link is bound to the requesting UA and refuses requests without
+	// the account cookie (403 "no cookie value"), so hand both to the downloader.
 	return &model.Link{
 		URL: downloadInfo.URL.URL,
 		Header: http.Header{
 			"User-Agent": []string{ua},
+			"Cookie":     []string{d.Cookie},
 		},
 	}, nil
 }
