@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -194,6 +195,7 @@ var aliyunShare115Config = driver.Config{
 type aliShareTokenResp struct {
 	ShareToken string `json:"share_token"`
 	ExpiresIn  int64  `json:"expires_in"`
+	Code       string `json:"code"`
 	Message    string `json:"message"`
 }
 
@@ -201,6 +203,7 @@ type aliWebTokenResp struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int64  `json:"expires_in"`
+	Code         string `json:"code"`
 	Message      string `json:"message"`
 }
 
@@ -300,25 +303,18 @@ func (d *AliyundriveShare2Pan115) Init(ctx context.Context) error {
 	if d.AliyunShare115Addition.Cookie == "" {
 		return errors.New("cookie (115) is required")
 	}
-	if err := d.ensureWebToken(); err != nil {
-		return fmt.Errorf("refresh aliyun token failed: %w", err)
-	}
-	if err := d.ensureShareToken(); err != nil {
-		return fmt.Errorf("get share token failed: %w", err)
-	}
-	// Learn the share drive id once; share listing items carry it.
-	if d.AliyunShare115Addition.ShareDriveId == "" {
-		if items, _, err := d.listShare(ctx, d.rootID(), ""); err == nil {
-			for _, it := range items {
-				if it.DriveId != "" {
-					d.AliyunShare115Addition.ShareDriveId = it.DriveId
-					d.save()
-					break
-				}
-			}
-		}
-	}
-	// The 115 cookie is validated lazily on first Link to keep Init fast.
+	// Cold start on purpose: Init does no network at all.
+	//
+	// alipan throttles `v2/share_link/get_share_token` to roughly ten calls per
+	// window per IP (measured: a 5 req/s serial run starts returning 429 at the
+	// 11th request), and alist initialises storages one after another, so a
+	// fleet of ~100 of these storages used to spend the whole quota on the
+	// first ten and mark every later one as broken.
+	//
+	// Both tokens (web + share) and the share drive id are therefore resolved
+	// lazily by the first List/Link; ensureShareToken also paces every caller
+	// through one process-wide gate and retries on 429. The 115 cookie stays
+	// lazily validated on the first Link.
 	return nil
 }
 
@@ -512,8 +508,16 @@ func (d *AliyundriveShare2Pan115) ensureWebToken() error {
 	if err != nil {
 		return err
 	}
+	if resp.AccessToken == "" && res != nil {
+		// same resty quirk as above: non-2xx bodies are not parsed for us
+		_ = json.Unmarshal(res.Body(), &resp)
+	}
 	if resp.AccessToken == "" {
-		return fmt.Errorf("token refresh rejected: %s", resp.Message)
+		status := 0
+		if res != nil {
+			status = res.StatusCode()
+		}
+		return fmt.Errorf("token refresh rejected (HTTP %d, code %q): %s", status, resp.Code, resp.Message)
 	}
 	d.AliyunShare115Addition.AccessToken = resp.AccessToken
 	if resp.RefreshToken != "" {
@@ -524,9 +528,36 @@ func (d *AliyundriveShare2Pan115) ensureWebToken() error {
 	if exp <= 0 {
 		exp = 7200
 	}
+	if exp > 600 {
+		exp -= int64(rand.Intn(600))
+	}
 	d.AliyunShare115Addition.TokenExpiresAt = time.Now().Unix() + exp
 	d.save()
 	return nil
+}
+
+// share token gate: alipan allows roughly ten get_share_token calls per window
+// per IP, so every storage in the process shares one pace. Without this, a
+// library scan that touches dozens of storages at once just moves the 429 storm
+// from Init to the first List.
+const (
+	shareTokenMinGap  = 1500 * time.Millisecond
+	shareTokenTries   = 3
+	shareTokenBackoff = 12 * time.Second
+)
+
+var (
+	shareTokenGateMu sync.Mutex
+	shareTokenNextAt time.Time
+)
+
+func shareTokenSlot() {
+	shareTokenGateMu.Lock()
+	defer shareTokenGateMu.Unlock()
+	if wait := time.Until(shareTokenNextAt); wait > 0 {
+		time.Sleep(wait)
+	}
+	shareTokenNextAt = time.Now().Add(shareTokenMinGap)
 }
 
 func (d *AliyundriveShare2Pan115) ensureShareToken() error {
@@ -539,26 +570,63 @@ func (d *AliyundriveShare2Pan115) ensureShareToken() error {
 	if d.AliyunShare115Addition.SharePwd != "" {
 		body["share_pwd"] = d.AliyunShare115Addition.SharePwd
 	}
-	var resp aliShareTokenResp
-	res, err := base.RestyClient.R().
-		SetBody(body).
-		SetResult(&resp).
-		Post(aliShareTokenURL)
-	logResp("ali:share-token", res, err)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < shareTokenTries; attempt++ {
+		if attempt > 0 {
+			wait := shareTokenBackoff * time.Duration(attempt)
+			log.Warnf("[xiaoya/115] get_share_token rate limited, retry %d/%d in %s",
+				attempt, shareTokenTries-1, wait)
+			time.Sleep(wait)
+		}
+		shareTokenSlot()
+		var resp aliShareTokenResp
+		res, err := base.RestyClient.R().
+			SetBody(body).
+			SetResult(&resp).
+			Post(aliShareTokenURL)
+		logResp("ali:share-token", res, err)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.ShareToken == "" && res != nil {
+			// resty skips SetResult on non-2xx responses, so a 429
+			// {"code":"TooManyRequests","message":"too many requests"} or a
+			// 400 InvalidResource.SharePwd arrives with an empty struct and
+			// the reason would be lost -- parse the raw body instead.
+			_ = json.Unmarshal(res.Body(), &resp)
+		}
+		if resp.ShareToken != "" {
+			d.AliyunShare115Addition.ShareToken = resp.ShareToken
+			exp := resp.ExpiresIn
+			if exp <= 0 {
+				exp = 7200
+			}
+			// jitter: keep a fleet of storages from expiring in the same
+			// second and hitting the gate together two hours later
+			if exp > 600 {
+				exp -= int64(rand.Intn(600))
+			}
+			d.AliyunShare115Addition.ShareTokenExpires = time.Now().Unix() + exp
+			d.save()
+			return nil
+		}
+		status := 0
+		if res != nil {
+			status = res.StatusCode()
+		}
+		if status == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("share token rate limited (HTTP 429)")
+			continue
+		}
+		// resty leaves Result empty on non-2xx, so the body has to be read
+		// from the raw response or the reason is lost entirely
+		return fmt.Errorf("share token rejected (HTTP %d, code %q): %s", status, resp.Code, resp.Message)
 	}
-	if resp.ShareToken == "" {
-		return fmt.Errorf("share token rejected: %s", resp.Message)
+	if lastErr == nil {
+		lastErr = errors.New("share token unavailable")
 	}
-	d.AliyunShare115Addition.ShareToken = resp.ShareToken
-	exp := resp.ExpiresIn
-	if exp <= 0 {
-		exp = 7200
-	}
-	d.AliyunShare115Addition.ShareTokenExpires = time.Now().Unix() + exp
-	d.save()
-	return nil
+	return lastErr
 }
 
 func (d *AliyundriveShare2Pan115) ensureOwnDriveId() error {
