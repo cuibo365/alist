@@ -40,6 +40,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/cookie"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -234,14 +235,45 @@ func (d *QuarkShare) tryLink(file model.Obj) (*model.Link, error) {
 		dlCookie = cookie.SetStr(dlCookie, "__puus", newPuus)
 	}
 
-	return &model.Link{
+	link := &model.Link{
 		URL: resp.Data[0].DownloadUrl,
 		Header: http.Header{
 			"User-Agent": []string{quarkUA},
 			"Referer":    []string{quarkReferer},
 			"Cookie":     []string{dlCookie},
 		},
-	}, nil
+	}
+	d.applyLinkLimit(link)
+	return link, nil
+}
+
+// default ranged-download tuning; see QuarkAddition.DownConcurrency.
+const (
+	defaultDownConcurrency = 3
+	defaultDownPartSizeMB  = 10
+)
+
+// applyLinkLimit turns on multi-connection ranged download for the proxy path.
+//
+// A share download URL is signed against the cookie of the request that minted
+// it, so WebDAV clients (which send none of it) cannot use it directly and
+// every WebDAV read goes through alist. Without Concurrency/PartSize that
+// proxy takes the transparent branch of server/common/proxy.go -- one
+// connection, no aggregation. Setting them makes it fetch PartSize chunks over
+// Concurrency connections and assemble them in order.
+func (d *QuarkShare) applyLinkLimit(link *model.Link) {
+	conc, partMB := d.QuarkAddition.DownConcurrency, d.QuarkAddition.DownPartSize
+	if conc < 0 {
+		return
+	}
+	if conc == 0 {
+		conc = defaultDownConcurrency
+	}
+	if partMB <= 0 {
+		partMB = defaultDownPartSizeMB
+	}
+	link.Concurrency = conc
+	link.PartSize = partMB * utils.MB
 }
 
 var _ driver.Driver = (*QuarkShare)(nil)
