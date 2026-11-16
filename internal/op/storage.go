@@ -11,6 +11,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/db"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
+	"github.com/alist-org/alist/v3/internal/listcache"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/generic_sync"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -327,6 +328,10 @@ func DeleteStorageById(ctx context.Context, id uint) error {
 	if err := db.DeleteStorageById(id); err != nil {
 		return errors.WithMessage(err, "failed delete storage in database")
 	}
+	// drop the disk listings as well: sqlite may hand the same id to a storage
+	// created later, and inheriting another storage's cache would be silent and
+	// very confusing.
+	listcache.DeleteStorage(storage.ID)
 	return nil
 }
 

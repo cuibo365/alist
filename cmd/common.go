@@ -17,6 +17,7 @@ func Init() {
 	bootstrap.InitConfig()
 	bootstrap.Log()
 	bootstrap.InitDB()
+	bootstrap.InitListCache()
 
 	if v3_46_0.IsLegacyRoleDetected() {
 		utils.Log.Warnf("Detected legacy role format, executing ConvertLegacyRoles patch early...")

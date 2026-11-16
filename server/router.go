@@ -163,6 +163,9 @@ func admin(g *gin.RouterGroup) {
 	storage.POST("/disable", handles.DisableStorage)
 	storage.POST("/load_all", handles.LoadAllStorages)
 
+	cache := g.Group("/cache")
+	cache.POST("/refresh", handles.RefreshCache)
+
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)
 	driver.GET("/names", handles.ListDriverNames)

@@ -10,6 +10,7 @@ import (
 	"github.com/Xhofe/go-cache"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
+	"github.com/alist-org/alist/v3/internal/listcache"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/stream"
 	"github.com/alist-org/alist/v3/pkg/generic_sync"
@@ -149,15 +150,45 @@ func addCacheObj(storage driver.Driver, path string, newObj model.Obj) {
 }
 
 func ClearCache(storage driver.Driver, path string) {
+	PurgeCache(storage, path)
+}
+
+// PurgeCache drops the cached listing of path and of every descendant, from
+// both layers, and reports how many on-disk rows were removed.
+//
+// The memory eviction walks the cached tree, which stops at the first expired
+// level; the disk delete is a plain prefix match and does not depend on that
+// walk, so the two together also cover the levels the recursion cannot reach.
+func PurgeCache(storage driver.Driver, path string) int64 {
+	clearCacheRec(storage, path)
+	return listcache.DeletePrefix(storage, path)
+}
+
+func clearCacheRec(storage driver.Driver, path string) {
 	objs, ok := listCache.Get(Key(storage, path))
 	if ok {
 		for _, obj := range objs {
 			if obj.IsDir() {
-				ClearCache(storage, stdpath.Join(path, obj.GetName()))
+				clearCacheRec(storage, stdpath.Join(path, obj.GetName()))
 			}
 		}
 	}
 	listCache.Del(Key(storage, path))
+}
+
+// RefreshListCache purges path and everything below it, then rebuilds only that
+// one level. Descendants stay cold on purpose: once the parent is cached again,
+// opening a child costs a single listing instead of a walk up the whole path.
+func RefreshListCache(ctx context.Context, rawPath string) (int64, bool, error) {
+	storage, actualPath, err := GetStorageAndActualPath(rawPath)
+	if err != nil {
+		return 0, false, err
+	}
+	deleted := PurgeCache(storage, actualPath)
+	if _, err := List(ctx, storage, actualPath, model.ListArgs{Refresh: true, ReqPath: rawPath}); err != nil {
+		return deleted, false, err
+	}
+	return deleted, true, nil
 }
 
 func Key(storage driver.Driver, path string) string {
@@ -175,6 +206,11 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 	if !args.Refresh {
 		if files, ok := listCache.Get(key); ok {
 			log.Debugf("use cache when list %s", path)
+			return files, nil
+		}
+		if files, ok := listcache.Get(storage, path); ok {
+			log.Debugf("use disk cache when list %s", path)
+			listCache.Set(key, files, cache.WithEx[[]model.Obj](time.Minute*time.Duration(storage.GetStorage().CacheExpiration)))
 			return files, nil
 		}
 	}
@@ -216,9 +252,11 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 			if len(files) > 0 {
 				log.Debugf("set cache: %s => %+v", key, files)
 				listCache.Set(key, files, cache.WithEx[[]model.Obj](time.Minute*time.Duration(storage.GetStorage().CacheExpiration)))
+				listcache.Set(storage, path, files)
 			} else {
 				log.Debugf("del cache: %s", key)
 				listCache.Del(key)
+				listcache.Delete(storage, path)
 			}
 		}
 		return files, nil
@@ -295,7 +333,20 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 		return obj, nil
 	}
 	log.Debugf("cant find obj with name: %s", name)
+	dropStaleCache(storage, path, dir)
 	return nil, errors.WithStack(errs.ObjectNotFound)
+}
+
+// dropStaleCache forgets listings that pointed at something which no longer
+// exists. Only the caches are dropped, never retried: the caller still sees the
+// error, and the next request resolves from the source. The parent listing is
+// dropped too because that is where the stale entry came from -- deleting only
+// the child's own entry would let the next lookup read the same dead id again.
+func dropStaleCache(storage driver.Driver, path, parent string) {
+	listCache.Del(Key(storage, path))
+	listCache.Del(Key(storage, parent))
+	listcache.Delete(storage, path)
+	listcache.Delete(storage, parent)
 }
 
 func GetUnwrap(ctx context.Context, storage driver.Driver, path string) (model.Obj, error) {
