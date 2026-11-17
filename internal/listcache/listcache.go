@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -33,11 +34,12 @@ import (
 )
 
 const (
-	// maxObjsPerDir keeps a single huge directory (thousands of episodes) from
-	// bloating the cache file in one go.
-	maxObjsPerDir = 2000
-	writerQueue   = 1024
-	writerBatch   = 32
+	// No size or entry-count limits on purpose: every listed directory is
+	// persisted, however big it is. A share of 4K remuxes running to a few
+	// thousand entries is exactly the case a disk cache exists to serve, so
+	// refusing it would defeat the feature.
+	writerQueue = 1024
+	writerBatch = 32
 )
 
 type row struct {
@@ -57,6 +59,12 @@ var (
 	db      *gorm.DB
 	enabled bool
 	jobs    chan row
+	done    chan struct{}
+	closed  atomic.Bool
+	// sendMu guards "enqueue into jobs" against "close(jobs)" so that a Set
+	// arriving during shutdown can never send on a closed channel.
+	sendMu  sync.RWMutex
+	stopped bool
 )
 
 // Init opens (or creates) the cache database. Any failure disables the disk
@@ -78,9 +86,43 @@ func Init(dataDir string) {
 		db = gdb
 		enabled = true
 		jobs = make(chan row, writerQueue)
+		done = make(chan struct{})
+		// Surface the row count at startup: an empty table means nothing has
+		// been persisted yet, which is the usual reason no "disk hit" line ever
+		// shows up.
+		var rows int64
+		if err := gdb.Model(&row{}).Count(&rows).Error; err != nil {
+			log.Warnf("[listcache] count rows failed: %v", err)
+		}
 		go writer()
-		log.Infof("[listcache] disk list cache: %s", path)
+		log.Infof("[listcache] disk list cache: %s (%d rows)", path, rows)
 	})
+}
+
+// Close flushes the pending write queue and closes the database. Without it the
+// sqlite connection (and therefore cache.db-wal / cache.db-shm) stays open for
+// the whole run and the WAL is only recovered on the next start.
+func Close() {
+	if !enabled {
+		return
+	}
+	sendMu.Lock()
+	if stopped {
+		sendMu.Unlock()
+		<-done
+		return
+	}
+	stopped = true
+	close(jobs)
+	sendMu.Unlock()
+	<-done
+	closed.Store(true)
+	if sqlDB, err := db.DB(); err == nil {
+		if err := sqlDB.Close(); err != nil {
+			log.Warnf("[listcache] close failed: %v", err)
+		}
+	}
+	log.Infof("[listcache] disk list cache closed")
 }
 
 // Enabled reports whether the disk layer is usable.
@@ -89,8 +131,7 @@ func Enabled() bool {
 }
 
 func cacheable(storage driver.Driver) bool {
-	s := storage.GetStorage()
-	return s != nil && !storage.Config().NoCache && s.CacheExpiration > 0
+	return why(storage) == ""
 }
 
 func codecOf(storage driver.Driver) (driver.ListCacheCodec, bool) {
@@ -98,10 +139,51 @@ func codecOf(storage driver.Driver) (driver.ListCacheCodec, bool) {
 	return c, ok
 }
 
+// explained remembers which storage already had its "not persisted" reason
+// logged, so a hot directory does not repeat the same line on every request.
+// Without this the first thing anyone debugging a empty cache.db asks is "why
+// is nothing written", and the answer would otherwise be invisible unless the
+// whole process runs at debug level.
+var explained sync.Map // storage id -> struct{}
+
+func explainSkip(storage driver.Driver, reason string) {
+	s := storage.GetStorage()
+	if s == nil {
+		return
+	}
+	if _, loaded := explained.LoadOrStore(s.ID, struct{}{}); !loaded {
+		log.Infof("[listcache] storage %d (%s) is not persisted to disk: %s", s.ID, s.MountPath, reason)
+	}
+}
+
+// why explains why a storage cannot use the disk layer. It returns "" when the
+// storage is usable.
+func why(storage driver.Driver) string {
+	s := storage.GetStorage()
+	switch {
+	case s == nil:
+		return "no storage"
+	case storage.Config().NoCache:
+		return "no_cache is on in the driver config"
+	case s.CacheExpiration <= 0:
+		return "cache_expiration is 0"
+	case s.PersistCache == "off":
+		return "persist_cache is off"
+	}
+	if _, ok := codecOf(storage); !ok {
+		return fmt.Sprintf("%T does not implement driver.ListCacheCodec", storage)
+	}
+	return ""
+}
+
 // Get returns a persisted listing, if the driver supports it and the entry
 // exists. Callers are responsible for refilling the memory layer.
 func Get(storage driver.Driver, path string) ([]model.Obj, bool) {
-	if !enabled || !cacheable(storage) {
+	if !enabled || closed.Load() {
+		return nil, false
+	}
+	if !cacheable(storage) {
+		explainSkip(storage, why(storage))
 		return nil, false
 	}
 	codec, ok := codecOf(storage)
@@ -126,16 +208,15 @@ func Get(storage driver.Driver, path string) ([]model.Obj, bool) {
 // encoded here (so the queued job holds no live objects) and committed by the
 // writer goroutine.
 func Set(storage driver.Driver, path string, objs []model.Obj) {
-	if !enabled || len(objs) == 0 || !cacheable(storage) {
+	if !enabled || closed.Load() || len(objs) == 0 {
+		return
+	}
+	if !cacheable(storage) {
+		explainSkip(storage, why(storage))
 		return
 	}
 	codec, ok := codecOf(storage)
 	if !ok {
-		return
-	}
-	if len(objs) > maxObjsPerDir {
-		log.Debugf("[listcache] skip %s: %d entries > %d", path, len(objs), maxObjsPerDir)
-		Delete(storage, path)
 		return
 	}
 	items := make([]driver.ListCacheItem, 0, len(objs))
@@ -145,6 +226,11 @@ func Set(storage driver.Driver, path string, objs []model.Obj) {
 	data, err := codec.EncodeObjs(items)
 	if err != nil {
 		log.Warnf("[listcache] encode %s failed: %v", path, err)
+		return
+	}
+	sendMu.RLock()
+	defer sendMu.RUnlock()
+	if stopped {
 		return
 	}
 	select {
@@ -163,7 +249,7 @@ func Set(storage driver.Driver, path string, objs []model.Obj) {
 // Delete removes one entry. Synchronous: it is used on the read path, where a
 // stale row must be gone before the next request arrives.
 func Delete(storage driver.Driver, path string) {
-	if !enabled {
+	if !enabled || closed.Load() {
 		return
 	}
 	if err := db.Where("storage_id = ? AND path = ?", storage.GetStorage().ID, path).
@@ -179,7 +265,7 @@ func Delete(storage driver.Driver, path string) {
 // LIKE, so it needs no escaping and stays index friendly even when folder names
 // contain '%' or '_'.
 func DeletePrefix(storage driver.Driver, path string) int64 {
-	if !enabled {
+	if !enabled || closed.Load() {
 		return 0
 	}
 	id := storage.GetStorage().ID
@@ -199,7 +285,7 @@ func DeletePrefix(storage driver.Driver, path string) int64 {
 // an id after the row is deleted, which would otherwise hand a new storage the
 // old storage's listings.
 func DeleteStorage(storageID uint) int64 {
-	if !enabled {
+	if !enabled || closed.Load() {
 		return 0
 	}
 	res := db.Where("storage_id = ?", storageID).Delete(&row{})
@@ -210,15 +296,25 @@ func DeleteStorage(storageID uint) int64 {
 	return res.RowsAffected
 }
 
+// writer drains the queue until Close closes it, then commits whatever is left
+// before returning. The batch fill loop has to check the receive's ok flag,
+// otherwise a closed channel looks permanently ready and would feed zero rows.
 func writer() {
+	defer close(done)
 	for {
-		first := <-jobs
+		first, ok := <-jobs
+		if !ok {
+			return
+		}
 		batch := make([]row, 0, writerBatch)
 		batch = append(batch, first)
 	fill:
 		for len(batch) < writerBatch {
 			select {
-			case j := <-jobs:
+			case j, ok := <-jobs:
+				if !ok {
+					break fill
+				}
 				batch = append(batch, j)
 			default:
 				break fill
@@ -226,6 +322,8 @@ func writer() {
 		}
 		if err := db.Clauses(clause.OnConflict{UpdateAll: true}).Create(&batch).Error; err != nil {
 			log.Warnf("[listcache] persist %d rows failed: %v", len(batch), err)
+		} else {
+			log.Infof("[listcache] persisted %d row(s)", len(batch))
 		}
 	}
 }
