@@ -81,6 +81,21 @@ func getMainItems(config driver.Config) []driver.Item {
 			Help:     "The cache expiration time for this storage",
 		})
 	}
+	// Only drivers that declare PersistCache get the switch. Empty means the
+	// driver cannot persist listings at all, so the option would be a lie.
+	if config.PersistCache != "" {
+		def := config.PersistCache
+		if def != "on" && def != "off" {
+			def = "on"
+		}
+		items = append(items, driver.Item{
+			Name:    "persist_cache",
+			Type:    conf.TypeSelect,
+			Options: "on,off",
+			Default: def,
+			Help:    "Keep this storage's directory listings in cache.db so a restart does not list every folder again. \"off\" keeps them in memory only",
+		})
+	}
 	if !config.OnlyProxy && !config.OnlyLocal {
 		items = append(items, []driver.Item{{
 			Name: "web_proxy",

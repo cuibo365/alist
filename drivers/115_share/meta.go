@@ -25,6 +25,7 @@ var config = driver.Config{
 	Alert:             "",
 	NoOverwriteUpload: true,
 	NoUpload:          true,
+	PersistCache:      "on",
 }
 
 func init() {

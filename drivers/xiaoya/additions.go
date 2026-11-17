@@ -33,4 +33,5 @@ var quarkShareConfig = driver.Config{
 	NoUpload:          true,
 	DefaultRoot:       "0",
 	NoOverwriteUpload: true,
+	PersistCache:      "on",
 }

@@ -10,6 +10,7 @@ type Storage struct {
 	Order           int       `json:"order"`                                       // use to sort
 	Driver          string    `json:"driver"`                                      // driver used
 	CacheExpiration int       `json:"cache_expiration"`                            // cache expire time
+	PersistCache    string    `json:"persist_cache" gorm:"default:'on'"`           // per-storage disk list cache switch: "" (on) / "on" / "off"
 	Status          string    `json:"status"`
 	Addition        string    `json:"addition" gorm:"type:text"` // Additional information, defined in the corresponding driver
 	Remark          string    `json:"remark"`
