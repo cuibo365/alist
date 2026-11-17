@@ -576,3 +576,42 @@ func SplitFileByPartSize(fileSize int64, chunkSize int64) ([]oss.FileChunk, erro
 
 	return chunks, nil
 }
+
+// mergeSetCookie flattens the account cookie and the Set-Cookie values from
+// the download response into one Cookie header.
+//
+// The account cookie alone is not enough: webapi.115.com/files/download also
+// plants a WAF token (acw_tc) and a rotating 32-hex cookie, and the CDN
+// answers 403 "no cookie value" without them. Later values win, because a
+// freshly issued acw_tc must replace any stale copy carried by the account.
+func mergeSetCookie(account string, setCookies []string) string {
+	order := make([]string, 0, len(setCookies)+4)
+	values := map[string]string{}
+	add := func(kv string) {
+		i := strings.Index(kv, "=")
+		if i <= 0 {
+			return
+		}
+		name := strings.TrimSpace(kv[:i])
+		if name == "" {
+			return
+		}
+		if _, ok := values[name]; !ok {
+			order = append(order, name)
+		}
+		values[name] = strings.TrimSpace(kv[i+1:])
+	}
+	for _, p := range strings.Split(account, ";") {
+		add(p)
+	}
+	for _, sc := range setCookies {
+		add(strings.SplitN(sc, ";", 2)[0])
+	}
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		if v := values[name]; v != "" {
+			parts = append(parts, name+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
+}

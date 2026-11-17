@@ -2,6 +2,8 @@ package _115
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -71,6 +73,22 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if args.Header != nil {
 		userAgent = args.Header.Get("User-Agent")
 	}
+	// The CDN link is stamped with the UA that asked for it: the WAF cookie in
+	// the downurl response is bound to that UA. WebDAV and some players send no
+	// UA, which would make resty sign the cookie as go-resty while the proxy
+	// replays it as 115Browser — the CDN then answers "ua not match cookie".
+	if userAgent == "" {
+		userAgent = d.getUA()
+	}
+	// The plain web endpoint answers with JSON and hands back the WAF cookies
+	// it plants (acw_tc + a rotating 32-hex one). The app/chrome endpoint
+	// encrypts the body and keeps those in the SDK jar, which alist's proxy
+	// request never sees — that is what produced 403 "no cookie value".
+	if l, err := d.downlinkWebAPI(file.(*FileObj).PickCode, userAgent); err == nil {
+		return l, nil
+	} else {
+		utils.Log.Debugf("[115] webapi downurl failed, falling back to sdk: %v", err)
+	}
 	downloadInfo, err := d.client.DownloadWithUA(file.(*FileObj).PickCode, userAgent)
 	if err != nil {
 		return nil, err
@@ -79,17 +97,47 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 		URL:    downloadInfo.Url.Url,
 		Header: downloadInfo.Header,
 	}
-	// The 115 CDN requires the account Cookie on the download request, but the
-	// SDK sends cookies at the transport layer so they are absent from
-	// downloadInfo.Header. Without it, proxied downloads fail with
-	// 403 "no cookie value". Restore the Cookie so proxy mode works.
+	// The 115 CDN requires more than the account Cookie: the download response
+	// also plants a WAF token (acw_tc) and a rotating 32-hex cookie, and
+	// without them a proxied download fails with 403 "no cookie value".
 	if link.Header == nil {
 		link.Header = http.Header{}
 	}
-	if link.Header.Get("Cookie") == "" {
-		link.Header.Set("Cookie", d.Cookie)
-	}
+	link.Header.Set("Cookie", mergeSetCookie(d.Cookie, nil))
+	link.Header.Set("User-Agent", userAgent)
 	return link, nil
+}
+
+// downlinkWebAPI asks webapi.115.com/files/download for the link. One round
+// trip yields both the url and the Set-Cookie values the CDN requires.
+func (d *Pan115) downlinkWebAPI(pick, ua string) (*model.Link, error) {
+	resp, err := d.client.NewRequest().
+		SetQueryParam("pickcode", pick).
+		SetHeader("Cookie", d.Cookie).
+		SetHeader("User-Agent", ua).
+		Get("https://webapi.115.com/files/download")
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		State   bool   `json:"state"`
+		FileURL string `json:"file_url"`
+		ErrNo   int    `json:"errno"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(resp.Body(), &r); err != nil {
+		return nil, err
+	}
+	if !r.State || r.FileURL == "" {
+		return nil, fmt.Errorf("state=%v errno=%d error=%s", r.State, r.ErrNo, r.Error)
+	}
+	return &model.Link{
+		URL: r.FileURL,
+		Header: http.Header{
+			"Cookie":     {mergeSetCookie(d.Cookie, resp.Header().Values("Set-Cookie"))},
+			"User-Agent": {ua},
+		},
+	}, nil
 }
 
 func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {

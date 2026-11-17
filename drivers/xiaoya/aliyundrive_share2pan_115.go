@@ -52,11 +52,13 @@ import (
 	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/db"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 const (
@@ -183,11 +185,12 @@ type AliyunShare115Addition struct {
 }
 
 var aliyunShare115Config = driver.Config{
-	Name:        "AliyundriveShare2Pan115",
-	LocalSort:   false,
-	OnlyProxy:   false,
-	NoUpload:    true,
-	DefaultRoot: "root",
+	Name:         "AliyundriveShare2Pan115",
+	LocalSort:    false,
+	OnlyProxy:    false,
+	NoUpload:     true,
+	DefaultRoot:  "root",
+	PersistCache: "on",
 }
 
 // ---------- types ----------
@@ -378,6 +381,18 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 		log.Infof("[xiaoya/115:timing] %s total=%dms", strings.Join(marks, " "), time.Since(t0).Milliseconds())
 	}()
 
+	// The CDN link is stamped with the UA that asked for it. drivers/115 hands
+	// the caller's own UA (the browser's) to the download endpoint, so the link
+	// it returns opens directly in that same browser. Do the same here; fall
+	// back to the 115Browser UA when the caller sent none (webdav/s3/tasks).
+	ua := ua115()
+	if args.Header != nil {
+		if v := args.Header.Get("User-Agent"); v != "" {
+			ua = v
+		}
+	}
+	log.Infof("[xiaoya/115:ua] download UA = %s", ua)
+
 	// 1. context: tokens + drive ids + 115 client
 	if err := d.ensureWebToken(); err != nil {
 		return nil, err
@@ -406,7 +421,7 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 	key := cacheKey115(file.GetName(), file.GetSize())
 	pick := d.cachedPickcode(key)
 	if pick != "" {
-		if l, err := d.downlink(client, pick); err == nil {
+		if l, err := d.downlink(client, pick, ua); err == nil {
 			mark("cached-down")
 			return l, nil
 		}
@@ -422,7 +437,7 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 	}
 	if pick != "" {
 		d.storePickcode(key, pick)
-		l, err := d.downlink(client, pick)
+		l, err := d.downlink(client, pick, ua)
 		mark("down")
 		return l, err
 	}
@@ -443,7 +458,7 @@ func (d *AliyundriveShare2Pan115) Link(ctx context.Context, file model.Obj, args
 		return d.aliyunFallbackLink(ctx, file)
 	}
 	d.storePickcode(key, pick)
-	l, err := d.downlink(client, pick)
+	l, err := d.downlink(client, pick, ua)
 	mark("down")
 	return l, err
 }
@@ -486,27 +501,142 @@ func (d *AliyundriveShare2Pan115) save() {
 	op.MustSaveDriverStorage(d)
 }
 
+// ---------- account-wide web token ----------
+//
+// All xiaoya rows point at the same aliyun account, but each carries its own
+// RefreshToken: alipan rotates the refresh_token on every redemption and every
+// row persisted its own copy. Refreshing per storage therefore meant N logins
+// for one account on a cold start — N times the rate limit and N times the
+// chance of the account being flagged, plus N different access_tokens.
+//
+// So the web token is shared per account: the first storage that needs one
+// refreshes it, parks the result in a process-wide table, and writes the new
+// RefreshToken / access_token back into the addition of every sibling storage.
+// Siblings then reuse the table instead of refreshing again. Keeping the rows
+// in sync also means any row can seed the group after a restart.
+
+type accountTokenGroup struct {
+	mu           sync.Mutex
+	accessToken  string
+	refreshToken string
+	expiresAt    int64
+}
+
+var (
+	accountTokenGroupsMu sync.Mutex
+	accountTokenGroups   = map[string]*accountTokenGroup{}
+)
+
+func accountTokenGroupFor(key string) *accountTokenGroup {
+	accountTokenGroupsMu.Lock()
+	defer accountTokenGroupsMu.Unlock()
+	g, ok := accountTokenGroups[key]
+	if !ok {
+		g = &accountTokenGroup{}
+		accountTokenGroups[key] = g
+	}
+	return g
+}
+
+// tokenGroupKey identifies the aliyun account this storage belongs to.
+// RefreshToken cannot serve as the key because it rotates on every use; the
+// open-platform RefreshTokenOpen is copied verbatim from the xiaoya row and is
+// never rewritten by this driver, which makes it a stable per-account marker.
+// Storages without it keep the original one-refresh-per-storage behaviour.
+func (d *AliyundriveShare2Pan115) tokenGroupKey() string {
+	return tokenGroupKeyFor(d.AliyunShare115Addition.RefreshTokenOpen)
+}
+
+func tokenGroupKeyFor(refreshTokenOpen string) string {
+	if refreshTokenOpen == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(refreshTokenOpen))
+	return hex.EncodeToString(sum[:8])
+}
+
+// setTokenFields writes the runtime token fields. Callers serialise themselves
+// (d.mu in single-storage mode, the group mutex otherwise), so this must not
+// take a lock: ensureWebToken already holds one of the two.
+func (d *AliyundriveShare2Pan115) setTokenFields(access, refresh string, expiresAt int64) {
+	d.AliyunShare115Addition.AccessToken = access
+	d.AliyunShare115Addition.RefreshToken = refresh
+	d.AliyunShare115Addition.TokenExpiresAt = expiresAt
+}
+
 func (d *AliyundriveShare2Pan115) ensureWebToken() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.AliyunShare115Addition.AccessToken != "" && time.Now().Unix() < d.AliyunShare115Addition.TokenExpiresAt-60 {
+	// Fast path: a live access_token on this instance needs no group lookup.
+	if d.AliyunShare115Addition.AccessToken != "" &&
+		time.Now().Unix() < d.AliyunShare115Addition.TokenExpiresAt-60 {
 		return nil
 	}
-	// Always refresh the web refresh_token directly at the official endpoint.
-	// The xiaoya relay (oauth_token_url) and the open-token pair
-	// (RefreshTokenOpen / client_id / client_secret) are deliberately unused.
+	key := d.tokenGroupKey()
+	if key == "" {
+		// No account marker in the addition: keep the original behaviour.
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if err := d.refreshWebToken(nil); err != nil {
+			return err
+		}
+		d.save()
+		return nil
+	}
+	g := accountTokenGroupFor(key)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.accessToken != "" && time.Now().Unix() < g.expiresAt-60 {
+		// A sibling storage already refreshed for this account. Adopt the
+		// token in memory only: the broadcast that produced it already wrote
+		// every sibling row, so writing again here would just turn a burst of
+		// first hits (a library scan) into a burst of concurrent UPDATEs.
+		d.setTokenFields(g.accessToken, g.refreshToken, g.expiresAt)
+		return nil
+	}
+	if err := d.refreshWebToken(g); err != nil {
+		return err
+	}
+	d.broadcastAccountToken(key, g.refreshToken, g.accessToken, g.expiresAt)
+	return nil
+}
+
+// refreshWebToken redeems this storage's refresh_token and leaves the result in
+// the receiver (and in g when non-nil). One attempt only: a rejected token is
+// reported as-is instead of being papered over with a sibling's copy — siblings
+// hold independently rotated snapshots, and picking one of theirs would consume
+// a token the user cannot see being used.
+// It takes no lock: the caller holds d.mu (g == nil) or g.mu and is responsible
+// for persisting — broadcastAccountToken does it for the group mode so the row
+// is written exactly once.
+func (d *AliyundriveShare2Pan115) refreshWebToken(g *accountTokenGroup) error {
+	access, refresh, expiresAt, err := requestWebToken(d.AliyunShare115Addition.RefreshToken)
+	if err != nil {
+		return err
+	}
+	d.setTokenFields(access, refresh, expiresAt)
+	if g != nil {
+		g.accessToken, g.refreshToken, g.expiresAt = access, refresh, expiresAt
+	}
+	return nil
+}
+
+// requestWebToken redeems rt at the official web endpoint — the xiaoya relay
+// (oauth_token_url) and the open-token pair are deliberately unused.
+func requestWebToken(rt string) (access, refresh string, expiresAt int64, err error) {
+	if rt == "" {
+		return "", "", 0, errors.New("missing refresh_token")
+	}
 	body := base.Json{
-		"refresh_token": d.AliyunShare115Addition.RefreshToken,
+		"refresh_token": rt,
 		"grant_type":    "refresh_token",
 	}
 	var resp aliWebTokenResp
-	res, err := base.RestyClient.R().
+	res, reqErr := base.RestyClient.R().
 		SetBody(body).
 		SetResult(&resp).
 		Post(aliTokenURL)
-	logResp("ali:refresh-token", res, err)
-	if err != nil {
-		return err
+	logResp("ali:refresh-token", res, reqErr)
+	if reqErr != nil {
+		return "", "", 0, reqErr
 	}
 	if resp.AccessToken == "" && res != nil {
 		// same resty quirk as above: non-2xx bodies are not parsed for us
@@ -517,12 +647,13 @@ func (d *AliyundriveShare2Pan115) ensureWebToken() error {
 		if res != nil {
 			status = res.StatusCode()
 		}
-		return fmt.Errorf("token refresh rejected (HTTP %d, code %q): %s", status, resp.Code, resp.Message)
+		return "", "", 0,
+			fmt.Errorf("token refresh rejected (HTTP %d, code %q): %s", status, resp.Code, resp.Message)
 	}
-	d.AliyunShare115Addition.AccessToken = resp.AccessToken
+	refresh = rt
 	if resp.RefreshToken != "" {
-		// refresh_token rotates on every use; persist the new one
-		d.AliyunShare115Addition.RefreshToken = resp.RefreshToken
+		// refresh_token rotates on every use; keep the new one
+		refresh = resp.RefreshToken
 	}
 	exp := resp.ExpiresIn
 	if exp <= 0 {
@@ -531,9 +662,71 @@ func (d *AliyundriveShare2Pan115) ensureWebToken() error {
 	if exp > 600 {
 		exp -= int64(rand.Intn(600))
 	}
-	d.AliyunShare115Addition.TokenExpiresAt = time.Now().Unix() + exp
-	d.save()
-	return nil
+	return resp.AccessToken, refresh, time.Now().Unix() + exp, nil
+}
+
+// broadcastAccountToken writes the refreshed token set into every storage row of
+// the same account, so a restart does not trigger another round of refreshes.
+// Sibling memory copies are left untouched on purpose: they pick the token up
+// from the group table on their next ensureWebToken, which keeps this path free
+// of cross-instance locking.
+//
+// Rows come from the database, not from the loaded drivers: a sibling's
+// in-memory addition still holds the old JSON, and a storage that is currently
+// disabled is loaded nowhere. One SELECT loads every row of this driver, then
+// the matching ones are updated inside a single transaction (one fsync instead
+// of one per row).
+func (d *AliyundriveShare2Pan115) broadcastAccountToken(key, refresh, access string, expiresAt int64) {
+	var rows []model.Storage
+	if err := db.GetDb().Select("id", "addition").
+		Where("driver = ?", aliyunShare115Config.Name).Find(&rows).Error; err != nil {
+		log.Warnf("[xiaoya/115] read %s storages failed: %v", aliyunShare115Config.Name, err)
+		return
+	}
+	type target struct {
+		id  uint
+		add map[string]interface{}
+	}
+	targets := make([]target, 0, len(rows))
+	for _, row := range rows {
+		add := map[string]interface{}{}
+		if row.Addition != "" {
+			if err := json.Unmarshal([]byte(row.Addition), &add); err != nil {
+				log.Warnf("[xiaoya/115] storage #%d addition is not JSON: %v", row.ID, err)
+				continue
+			}
+		}
+		open, _ := add["RefreshTokenOpen"].(string)
+		if tokenGroupKeyFor(open) != key {
+			continue
+		}
+		add["RefreshToken"] = refresh
+		add["access_token"] = access
+		add["access_token_expires_at"] = expiresAt
+		targets = append(targets, target{id: row.ID, add: add})
+	}
+	if len(targets) == 0 {
+		return
+	}
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		for _, t := range targets {
+			raw, err := json.Marshal(t.add)
+			if err != nil {
+				log.Warnf("[xiaoya/115] storage #%d addition marshal failed: %v", t.id, err)
+				continue
+			}
+			if err := tx.Model(&model.Storage{}).Where("id = ?", t.id).
+				Update("addition", string(raw)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Warnf("[xiaoya/115] broadcast token to %d storage(s) failed: %v", len(targets), err)
+		return
+	}
+	log.Infof("[xiaoya/115] account token refreshed, written to %d storage(s)", len(targets))
 }
 
 // share token gate: alipan allows roughly ten get_share_token calls per window
@@ -1185,8 +1378,17 @@ func shortURL(raw string) string {
 	return u.Host + p
 }
 
-func (d *AliyundriveShare2Pan115) downlink(client *driver115.Pan115Client, pick string) (*model.Link, error) {
-	info, err := client.DownloadWithUA(pick, ua115())
+func (d *AliyundriveShare2Pan115) downlink(client *driver115.Pan115Client, pick, ua string) (*model.Link, error) {
+	// The plain web endpoint answers with JSON and, more importantly, hands
+	// back the WAF cookies it plants (acw_tc + a rotating 32-hex one). The
+	// app/chrome endpoint encrypts the body and keeps those in the SDK jar,
+	// where alist's proxy request cannot see them.
+	if l, err := d.downlinkWebAPI(client, pick, ua); err == nil {
+		return l, nil
+	} else {
+		log.Infof("[xiaoya/115:downurl] webapi pickcode %s failed: %v (fallback to sdk)", pick, err)
+	}
+	info, err := client.DownloadWithUA(pick, ua)
 	if err != nil {
 		log.Infof("[xiaoya/115:downurl] pickcode %s error: %v", pick, err)
 		return nil, err
@@ -1196,15 +1398,80 @@ func (d *AliyundriveShare2Pan115) downlink(client *driver115.Pan115Client, pick 
 	if header == nil {
 		header = http.Header{}
 	}
-	// The 115 CDN requires the account cookie on the download request; the
-	// SDK sends cookies at transport level so restore it into the header.
-	if header.Get("Cookie") == "" {
-		header.Set("Cookie", d.AliyunShare115Addition.Cookie)
-	}
-	if header.Get("User-Agent") == "" {
-		header.Set("User-Agent", ua115())
-	}
+	// A bare account cookie is not enough: the CDN answers 403 "no cookie
+	// value" without the WAF cookies, and it binds them to the UA the link was
+	// requested with.
+	header.Set("Cookie", mergeSetCookie(d.AliyunShare115Addition.Cookie, nil))
+	header.Set("User-Agent", ua)
 	return &model.Link{URL: info.Url.Url, Header: header}, nil
+}
+
+// downlinkWebAPI asks webapi.115.com/files/download for the link. One round
+// trip yields both the url and the Set-Cookie values the CDN requires.
+func (d *AliyundriveShare2Pan115) downlinkWebAPI(client *driver115.Pan115Client, pick, ua string) (*model.Link, error) {
+	resp, err := client.NewRequest().
+		SetQueryParam("pickcode", pick).
+		SetHeader("Cookie", d.AliyunShare115Addition.Cookie).
+		SetHeader("User-Agent", ua).
+		Get(webAPI115 + "/files/download")
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		State   bool   `json:"state"`
+		FileURL string `json:"file_url"`
+		ErrNo   int    `json:"errno"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(resp.Body(), &r); err != nil {
+		return nil, err
+	}
+	if !r.State || r.FileURL == "" {
+		return nil, fmt.Errorf("state=%v errno=%d error=%s", r.State, r.ErrNo, r.Error)
+	}
+	cookie := mergeSetCookie(d.AliyunShare115Addition.Cookie, resp.Header().Values("Set-Cookie"))
+	return &model.Link{
+		URL: r.FileURL,
+		Header: http.Header{
+			"Cookie":     {cookie},
+			"User-Agent": {ua},
+		},
+	}, nil
+}
+
+// mergeSetCookie flattens the account cookie and the Set-Cookie values from
+// the download response into one Cookie header. Later values win, because the
+// server-issued acw_tc must replace any stale copy carried by the account.
+func mergeSetCookie(account string, setCookies []string) string {
+	order := make([]string, 0, len(setCookies)+4)
+	values := map[string]string{}
+	add := func(kv string) {
+		i := strings.Index(kv, "=")
+		if i <= 0 {
+			return
+		}
+		name := strings.TrimSpace(kv[:i])
+		if name == "" {
+			return
+		}
+		if _, ok := values[name]; !ok {
+			order = append(order, name)
+		}
+		values[name] = strings.TrimSpace(kv[i+1:])
+	}
+	for _, p := range strings.Split(account, ";") {
+		add(p)
+	}
+	for _, sc := range setCookies {
+		add(strings.SplitN(sc, ";", 2)[0])
+	}
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		if v := values[name]; v != "" {
+			parts = append(parts, name+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func orDefault(v, def string) string {
