@@ -288,17 +288,32 @@ func mergeCookie(account string, setCookies []string) string {
 	return strings.Join(parts, "; ")
 }
 
+// login builds the client from the stored cookie without touching the network.
+//
+// It used to validate the share (getShareSnap) and the account (LoginCheck)
+// here. Those are one HTTP round trip each, every storage, and LoadStorages runs
+// them serially while the API still answers "Loading storage, please wait" — 208
+// share storages cost ~400 serial requests before the panel opens at all. The
+// share snap is exactly what the first List issues anyway, and LoginCheck only
+// fills client.UserID, which this driver never reads, so a cold start validates
+// nothing that is not validated by the first real request.
 func (d *Pan115Share) login() error {
+	if d.ShareCode == "" {
+		return errors.New("share_code is required")
+	}
+	if d.Cookie == "" && d.QRCodeToken == "" {
+		return errors.New("missing cookie or qrcode account")
+	}
 	var err error
 	opts := []driver115.Option{
 		driver115.UA(ua115()),
 	}
 	d.client = driver115.New(opts...)
-	if _, err = d.getShareSnapWithUA(ua115(), ""); err != nil {
-		return errors.Wrap(err, "failed to get share snap")
-	}
 	cr := &driver115.Credential{}
 	if d.QRCodeToken != "" {
+		// Not deferrable: the QR token is a one-time exchange for a cookie and
+		// is dropped from the addition right after. It is only non-empty on the
+		// first start following a QR login.
 		s := &driver115.QRCodeSession{
 			UID: d.QRCodeToken,
 		}
@@ -307,14 +322,12 @@ func (d *Pan115Share) login() error {
 		}
 		d.Cookie = fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", cr.UID, cr.CID, cr.SEID, cr.KID)
 		d.QRCodeToken = ""
-	} else if d.Cookie != "" {
+	} else {
 		if err = cr.FromCookie(d.Cookie); err != nil {
 			return errors.Wrap(err, "failed to login by cookies")
 		}
 		d.client.ImportCredential(cr)
-	} else {
-		return errors.New("missing cookie or qrcode account")
 	}
 
-	return d.client.LoginCheck()
+	return nil
 }

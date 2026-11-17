@@ -121,9 +121,23 @@ func (d *QuarkShare) GetAddition() driver.Additional {
 	return &d.QuarkAddition
 }
 
+// Init only validates the addition locally. Fetching the share token here would
+// be one network round trip per storage, and LoadStorages walks the storages one
+// by one while conf.StoragesLoaded is still false, which means every API call
+// answers "Loading storage, please wait" until the slowest share answered. The
+// token is fetched on first use instead (see ensureShareToken).
 func (d *QuarkShare) Init(ctx context.Context) error {
 	if d.QuarkAddition.ShareId == "" {
 		return errors.New("share_id is required")
+	}
+	return nil
+}
+
+// ensureShareToken makes sure a share token is present, fetching one if the
+// addition carries none (cold start, or a row that never listed anything).
+func (d *QuarkShare) ensureShareToken() error {
+	if d.QuarkAddition.ShareToken != "" {
+		return nil
 	}
 	return d.getShareToken()
 }
@@ -137,7 +151,21 @@ func (d *QuarkShare) List(ctx context.Context, dir model.Obj, args model.ListArg
 	if parent == "" {
 		parent = "0"
 	}
+	// A token carried over from a previous run is the only one worth replacing:
+	// if we just fetched it in ensureShareToken, a failure is not about the token
+	// and refreshing again would only burn a request.
+	carriedOver := d.QuarkAddition.ShareToken != ""
+	if err := d.ensureShareToken(); err != nil {
+		return nil, err
+	}
 	files, err := d.getShareFiles(parent)
+	if err != nil && carriedOver {
+		// Quark answers 41016 "分享的stoken过期" for a dead token. Refresh once
+		// and retry, mirroring what Link does for the download path.
+		if refreshErr := d.getShareToken(); refreshErr == nil {
+			files, err = d.getShareFiles(parent)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +192,12 @@ func (d *QuarkShare) List(ctx context.Context, dir model.Obj, args model.ListArg
 }
 
 func (d *QuarkShare) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	// Best effort only: the attempt chain below refreshes the token anyway, this
+	// just avoids burning the first attempt when the storage never listed in
+	// this process (cold start).
+	if err := d.ensureShareToken(); err != nil {
+		log.Warnf("quark_share: get share token before link failed: %v", err)
+	}
 	// Attempt chain: raw -> refresh stoken -> refresh __puus -> raw again.
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
