@@ -209,7 +209,10 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 			return files, nil
 		}
 		if files, ok := listcache.Get(storage, path); ok {
-			log.Debugf("use disk cache when list %s", path)
+			// Info level on purpose: this is the only way to see that the disk
+			// layer is actually working without switching the whole process to
+			// debug, which also turns on gin/caller sql logging.
+			log.Infof("[listcache] disk hit %s (%d objs)", key, len(files))
 			listCache.Set(key, files, cache.WithEx[[]model.Obj](time.Minute*time.Duration(storage.GetStorage().CacheExpiration)))
 			return files, nil
 		}
@@ -333,20 +336,26 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 		return obj, nil
 	}
 	log.Debugf("cant find obj with name: %s", name)
-	dropStaleCache(storage, path, dir)
+	dropStaleCache(storage, path)
 	return nil, errors.WithStack(errs.ObjectNotFound)
 }
 
-// dropStaleCache forgets listings that pointed at something which no longer
-// exists. Only the caches are dropped, never retried: the caller still sees the
-// error, and the next request resolves from the source. The parent listing is
-// dropped too because that is where the stale entry came from -- deleting only
-// the child's own entry would let the next lookup read the same dead id again.
-func dropStaleCache(storage driver.Driver, path, parent string) {
+// dropStaleCache forgets the listing of an object that is no longer there.
+// Only the caches are dropped, never retried: the caller still sees the error,
+// and the next request resolves from the source.
+//
+// The parent listing is deliberately kept. Reaching here means the parent
+// listing was read successfully and simply does not contain this name, so the
+// parent cache is up to date and dropping it buys nothing. It is also actively
+// harmful: an Alias mount fans out to several storages, and the ones that do
+// not hold the requested object take this path on every single request. When
+// the parent was dropped too, each of them had to re-list it over the network
+// on the next call, failed to find the name again, and dropped it again --
+// a permanent "list, miss, drop, list" loop that kept every request slow. With
+// the parent kept, a missing object is decided locally from the cached listing.
+func dropStaleCache(storage driver.Driver, path string) {
 	listCache.Del(Key(storage, path))
-	listCache.Del(Key(storage, parent))
 	listcache.Delete(storage, path)
-	listcache.Delete(storage, parent)
 }
 
 func GetUnwrap(ctx context.Context, storage driver.Driver, path string) (model.Obj, error) {
