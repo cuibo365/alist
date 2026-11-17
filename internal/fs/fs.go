@@ -5,6 +5,7 @@ import (
 	"github.com/alist-org/alist/v3/server/common"
 	log "github.com/sirupsen/logrus"
 	"io"
+	"time"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
@@ -28,12 +29,19 @@ type ListArgs struct {
 }
 
 func List(ctx context.Context, path string, args *ListArgs) ([]model.Obj, error) {
+	start := time.Now()
 	res, err := list(ctx, path, args)
 	if err != nil {
 		if !args.NoLog {
 			log.Errorf("failed list %s: %+v", path, err)
 		}
 		return nil, err
+	}
+	// Print the directory itself: the gin access log only says
+	// POST "/api/fs/list", which makes it impossible to tell which folder a slow
+	// or failed listing belonged to.
+	if !args.NoLog {
+		log.Infof("fs/list %s: %d objs in %s", path, len(res), time.Since(start).Round(time.Millisecond))
 	}
 	return res, nil
 }

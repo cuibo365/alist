@@ -64,8 +64,16 @@ type FsListResp struct {
 }
 
 type ObjLabelResp struct {
-	Id           string                     `json:"id"`
-	Path         string                     `json:"path"`
+	Id string `json:"id"`
+	// Path 是「存储内部相对路径」（op.List 时由 op/fs.go 的 SetPath 逐层拼出来，
+	// 不含挂载点）。暂时不下发：
+	//   - 服务端没有任何地方回读它；
+	//   - 驱动内部定位文件用的是内存里的 obj，不经过这个 JSON；
+	//   - 前端用 name + 当前目录拼 URL，也不用它；
+	//   - 需要完整路径的调用方应该看 virtual_path（含挂载点，可直接回传给
+	//     /api/fs/get 之类接口）。
+	// 恢复时：取消下面两行的注释，并恢复 toObjsResp 里的 `Path: obj.GetPath()`。
+	// Path         string                     `json:"path"`
 	VirtualPath  string                     `json:"virtual_path"`
 	Name         string                     `json:"name"`
 	Size         int64                      `json:"size"`
@@ -318,8 +326,9 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjLabelResp {
 		thumb, _ := model.GetThumb(obj)
 		storageClass, _ := model.GetStorageClass(obj)
 		resp = append(resp, ObjLabelResp{
-			Id:           obj.GetID(),
-			Path:         obj.GetPath(),
+			Id: obj.GetID(),
+			// Path 暂时不下发，原因见 ObjLabelResp 定义处的注释。
+			// Path:         obj.GetPath(),
 			VirtualPath:  utils.FixAndCleanPath(stdpath.Join(parent, obj.GetName())),
 			Name:         obj.GetName(),
 			Size:         obj.GetSize(),
