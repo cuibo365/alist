@@ -164,6 +164,7 @@ func admin(g *gin.RouterGroup) {
 	storage.POST("/load_all", handles.LoadAllStorages)
 
 	cache := g.Group("/cache")
+	cache.GET("/list", handles.InspectCache)
 	cache.POST("/refresh", handles.RefreshCache)
 
 	driver := g.Group("/driver")

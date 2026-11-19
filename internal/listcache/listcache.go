@@ -246,6 +246,43 @@ func Set(storage driver.Driver, path string, objs []model.Obj) {
 	}
 }
 
+// Inspect returns the rows of path and of every descendant, in path order.
+// Rows of other storages are never included: like DeletePrefix, the prefix
+// match is scoped to the storage id so that two storages sharing a mount path
+// shape cannot see each other's entries.
+//
+// path "/" or "" means "every row of this storage", which is what the admin
+// inspector shows when it is pointed at a mount root.
+func Inspect(storage driver.Driver, path string) []driver.ListCacheRow {
+	if !enabled || closed.Load() {
+		return nil
+	}
+	q := db.Where("storage_id = ?", storage.GetStorage().ID)
+	if path != "" && path != "/" {
+		// Same byte-range descendant match as DeletePrefix: no escaping, and
+		// it stays on the primary key index.
+		q = q.Where("path = ? OR (path >= ? AND path < ?)", path, path+"/", path+"0")
+	}
+	var rows []row
+	if err := q.Order("path").Find(&rows).Error; err != nil {
+		log.Warnf("[listcache] inspect %s failed: %v", path, err)
+		return nil
+	}
+	s := storage.GetStorage()
+	out := make([]driver.ListCacheRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, driver.ListCacheRow{
+			StorageID: r.StorageID,
+			MountPath: s.MountPath,
+			Driver:    s.Driver,
+			Path:      r.Path,
+			Size:      r.Size,
+			UpdatedAt: r.UpdatedAt,
+		})
+	}
+	return out
+}
+
 // Delete removes one entry. Synchronous: it is used on the read path, where a
 // stale row must be gone before the next request arrives.
 func Delete(storage driver.Driver, path string) {

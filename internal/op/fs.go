@@ -156,12 +156,24 @@ func ClearCache(storage driver.Driver, path string) {
 // PurgeCache drops the cached listing of path and of every descendant, from
 // both layers, and reports how many on-disk rows were removed.
 //
+// It works on a resolved storage, so it only reaches rows that belong to that
+// storage id. Forwarding drivers (Alias) own no rows, which is why a purge
+// driven by a mount path has to go through fs.PurgeCache instead: that one
+// dispatches to driver.ListCachePurger and follows the forwarding chain.
+//
 // The memory eviction walks the cached tree, which stops at the first expired
 // level; the disk delete is a plain prefix match and does not depend on that
 // walk, so the two together also cover the levels the recursion cannot reach.
 func PurgeCache(storage driver.Driver, path string) int64 {
 	clearCacheRec(storage, path)
 	return listcache.DeletePrefix(storage, path)
+}
+
+// InspectListCache returns the persisted listing rows of path and of every
+// descendant for one resolved storage. Like PurgeCache it cannot see through a
+// forwarding driver; start from fs.InspectCache when you only have a mount path.
+func InspectListCache(storage driver.Driver, path string) []driver.ListCacheRow {
+	return listcache.Inspect(storage, path)
 }
 
 func clearCacheRec(storage driver.Driver, path string) {
@@ -174,21 +186,6 @@ func clearCacheRec(storage driver.Driver, path string) {
 		}
 	}
 	listCache.Del(Key(storage, path))
-}
-
-// RefreshListCache purges path and everything below it, then rebuilds only that
-// one level. Descendants stay cold on purpose: once the parent is cached again,
-// opening a child costs a single listing instead of a walk up the whole path.
-func RefreshListCache(ctx context.Context, rawPath string) (int64, bool, error) {
-	storage, actualPath, err := GetStorageAndActualPath(rawPath)
-	if err != nil {
-		return 0, false, err
-	}
-	deleted := PurgeCache(storage, actualPath)
-	if _, err := List(ctx, storage, actualPath, model.ListArgs{Refresh: true, ReqPath: rawPath}); err != nil {
-		return deleted, false, err
-	}
-	return deleted, true, nil
 }
 
 func Key(storage driver.Driver, path string) string {
