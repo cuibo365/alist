@@ -6,6 +6,8 @@ output/
 # Binaries for programs and plugins
 *.exe
 *.exe~
+# linux build output (build-linux.bat), no extension so *.exe does not cover it
+alist-c-linux-*
 *.dll
 *.so
 *.dylib
