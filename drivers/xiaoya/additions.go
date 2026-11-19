@@ -27,9 +27,16 @@ type QuarkAddition struct {
 }
 
 var quarkShareConfig = driver.Config{
-	Name:              "QuarkShare",
-	LocalSort:         false,
-	OnlyProxy:         false,
+	Name:      "QuarkShare",
+	LocalSort: false,
+	// A Quark share download URL is signed against the cookie of the request
+	// that minted it, and the CDN also wants the matching UA and Referer. A
+	// 302 hands the client a bare URL, so browsers and players get 412/403
+	// and WebDAV clients send none of the headers at all. Serving the link
+	// directly only ever worked for the rare file whose URL happened to be
+	// public, so the storage always proxies: the headers, the ranged
+	// download tuning and the cookie stay on this side.
+	OnlyProxy:         true,
 	NoUpload:          true,
 	DefaultRoot:       "0",
 	NoOverwriteUpload: true,
